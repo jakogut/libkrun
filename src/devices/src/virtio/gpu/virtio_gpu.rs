@@ -850,21 +850,15 @@ impl VirtioGpu {
         }
         let addr = shm_region.host_addr + offset;
 
-        if let Ok(export) = self.rutabaga.export_blob(resource_id) {
-            // SHM and DMABUF are both regular host fds whose pages can be exposed
-            // to the guest by mmap'ing them directly into the virtio shm region.
-            // For SHM (memfd) this has always worked. For DMABUF it had been
-            // delegated to virgl_renderer_resource_map_fixed, which only handles
-            // virglrenderer-allocated GPU memory and silently no-ops for external
-            // dma-bufs — leaving the guest blob backed by zero pages. That broke
-            // muvm camera capture, where the v4l2 source exports kernel buffers
-            // via VIDIOC_EXPBUF as dma-bufs, the muvm bridge forwards the fd
-            // across SCM_RIGHTS, libkrun classifies it as DMABUF, and the guest's
-            // CREATE_BLOB allocates a host-backed-by-nothing blob. Mapping the
-            // dma-buf fd directly here gives the guest real, live pages.
-            if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_SHM
-                || export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_DMABUF
+        match self.rutabaga.export_blob(resource_id) {
+            Ok(export)
+                if matches!(
+                    export.handle_type,
+                    RUTABAGA_MEM_HANDLE_TYPE_SHM | RUTABAGA_MEM_HANDLE_TYPE_DMABUF
+                ) =>
             {
+                // Map exported fds directly, including external dma-bufs that
+                // have no renderer-owned allocation for the fixed mapper.
                 let ret = unsafe {
                     libc::mmap(
                         addr as *mut libc::c_void,
@@ -882,10 +876,14 @@ impl VirtioGpu {
                     );
                     return Err(ErrUnspec);
                 }
-            } else if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD {
+            }
+            Ok(export) if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD => {
                 mapping::resource_map_fixed(resource_id, addr)?;
-            } else {
-                return Err(ErrUnspec);
+            }
+            Ok(_) => return Err(ErrUnspec),
+            Err(_) => {
+                // Native resources may be mappable even when fd export fails.
+                mapping::resource_map_fixed(resource_id, addr)?;
             }
         }
 
