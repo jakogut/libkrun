@@ -12,6 +12,8 @@ use std::convert::TryFrom;
 use std::io::Error as SysError;
 use std::io::IoSliceMut;
 use std::mem::size_of;
+#[cfg(target_os = "linux")]
+use std::mem::transmute;
 use std::os::raw::c_char;
 use std::os::raw::c_int;
 use std::os::raw::c_void;
@@ -20,6 +22,8 @@ use std::panic::catch_unwind;
 use std::process::abort;
 use std::ptr::null_mut;
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::sync::LazyLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
@@ -39,6 +43,52 @@ use crate::rutabaga_os::SafeDescriptor;
 use crate::rutabaga_utils::*;
 
 type Query = virgl_renderer_export_query;
+
+#[cfg(target_os = "linux")]
+type ResourceMapFixed = unsafe extern "C" fn(u32, *mut c_void) -> c_int;
+
+#[cfg(target_os = "linux")]
+static RESOURCE_MAP_FIXED: LazyLock<Option<ResourceMapFixed>> =
+    LazyLock::new(resolve_resource_map_fixed);
+
+#[cfg(target_os = "linux")]
+fn resolve_resource_map_fixed() -> Option<ResourceMapFixed> {
+    let symbol = unsafe {
+        libc::dlsym(
+            libc::RTLD_DEFAULT,
+            c"virgl_renderer_resource_map_fixed".as_ptr(),
+        )
+    };
+    if symbol.is_null() {
+        None
+    } else {
+        Some(unsafe { transmute::<*mut c_void, ResourceMapFixed>(symbol) })
+    }
+}
+
+/// Returns whether virglrenderer provides fixed-address resource mappings.
+pub fn supports_virgl_renderer_resource_map_fixed() -> bool {
+    #[cfg(target_os = "linux")]
+    return RESOURCE_MAP_FIXED.is_some();
+
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn call_resource_map_fixed(
+    function: Option<ResourceMapFixed>,
+    resource_id: u32,
+    addr: u64,
+) -> RutabagaResult<()> {
+    let function = function.ok_or(RutabagaError::Unsupported)?;
+    let ret = unsafe { function(resource_id, addr as *mut c_void) };
+    if ret != 0 {
+        return Err(RutabagaError::MappingFailed(ret));
+    }
+
+    Ok(())
+}
 
 /// The virtio-gpu backend state tracker which supports accelerated rendering.
 pub struct VirglRenderer {}
@@ -432,6 +482,10 @@ impl Drop for VirglRenderer {
 }
 
 impl RutabagaComponent for VirglRenderer {
+    fn supports_resource_map(&self) -> bool {
+        supports_virgl_renderer_resource_map_fixed()
+    }
+
     fn get_capset_info(&self, capset_id: u32) -> (u32, u32) {
         let mut version = 0;
         let mut size = 0;
@@ -704,18 +758,10 @@ impl RutabagaComponent for VirglRenderer {
         _prot: i32,
         _flags: i32,
     ) -> RutabagaResult<()> {
-        #[cfg(feature = "virgl_resource_map2")]
-        {
-            let ret = unsafe {
-                virgl_renderer_resource_map_fixed(_resource_id, _addr as *mut libc::c_void)
-            };
-            if ret != 0 {
-                return Err(RutabagaError::MappingFailed(ret));
-            }
+        #[cfg(target_os = "linux")]
+        return call_resource_map_fixed(*RESOURCE_MAP_FIXED, _resource_id, _addr);
 
-            Ok(())
-        }
-        #[cfg(not(feature = "virgl_resource_map2"))]
+        #[cfg(not(target_os = "linux"))]
         Err(RutabagaError::Unsupported)
     }
 
@@ -806,5 +852,35 @@ impl RutabagaComponent for VirglRenderer {
         };
         ret_to_res(ret)?;
         Ok(Box::new(VirglRendererContext { ctx_id }))
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    unsafe extern "C" fn map_success(_resource_id: u32, _addr: *mut c_void) -> c_int {
+        0
+    }
+
+    unsafe extern "C" fn map_failure(_resource_id: u32, _addr: *mut c_void) -> c_int {
+        -libc::EINVAL
+    }
+
+    #[test]
+    fn resource_map_fixed_is_unsupported_when_missing() {
+        assert!(matches!(
+            call_resource_map_fixed(None, 1, 0x1000),
+            Err(RutabagaError::Unsupported)
+        ));
+    }
+
+    #[test]
+    fn resource_map_fixed_propagates_results() {
+        assert!(call_resource_map_fixed(Some(map_success), 1, 0x1000).is_ok());
+        match call_resource_map_fixed(Some(map_failure), 1, 0x1000) {
+            Err(RutabagaError::MappingFailed(code)) => assert_eq!(code, -libc::EINVAL),
+            result => panic!("unexpected result: {result:?}"),
+        }
     }
 }

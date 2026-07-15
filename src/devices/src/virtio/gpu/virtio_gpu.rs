@@ -20,16 +20,12 @@ use krun_display::{
 use libc::c_void;
 #[cfg(target_os = "macos")]
 use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_APPLE;
-#[cfg(all(feature = "virgl_resource_map2", target_os = "linux"))]
-use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_DMABUF;
-#[cfg(all(not(feature = "virgl_resource_map2"), target_os = "linux"))]
-use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD;
-#[cfg(all(feature = "virgl_resource_map2", target_os = "linux"))]
-use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_SHM;
 #[cfg(target_os = "linux")]
 use rutabaga_gfx::{
     RUTABAGA_CHANNEL_TYPE_PW, RUTABAGA_CHANNEL_TYPE_X11, RUTABAGA_MAP_ACCESS_MASK,
     RUTABAGA_MAP_ACCESS_READ, RUTABAGA_MAP_ACCESS_RW, RUTABAGA_MAP_ACCESS_WRITE,
+    RUTABAGA_MEM_HANDLE_TYPE_DMABUF, RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD,
+    RUTABAGA_MEM_HANDLE_TYPE_SHM,
 };
 use rutabaga_gfx::{
     RUTABAGA_CHANNEL_TYPE_WAYLAND, RUTABAGA_MAP_CACHE_MASK, ResourceCreate3D, ResourceCreateBlob,
@@ -756,8 +752,22 @@ impl VirtioGpu {
     /// rutabaga as ExternalMapping.
     /// When sandboxing is enabled, external_blob is set and opaque fds must be mapped in the
     /// hypervisor process by Vulkano using metadata provided by Rutabaga::vulkan_info().
-    #[cfg(all(not(feature = "virgl_resource_map2"), target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     pub fn resource_map_blob(
+        &mut self,
+        resource_id: u32,
+        shm_region: &VirtioShmRegion,
+        offset: u64,
+    ) -> VirtioGpuResult {
+        if self.rutabaga.supports_resource_map() {
+            self.resource_map_blob_fixed(resource_id, shm_region, offset)
+        } else {
+            self.resource_map_blob_legacy(resource_id, shm_region, offset)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn resource_map_blob_legacy(
         &mut self,
         resource_id: u32,
         shm_region: &VirtioShmRegion,
@@ -813,8 +823,8 @@ impl VirtioGpu {
             map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
         })
     }
-    #[cfg(all(feature = "virgl_resource_map2", target_os = "linux"))]
-    pub fn resource_map_blob(
+    #[cfg(target_os = "linux")]
+    fn resource_map_blob_fixed(
         &mut self,
         resource_id: u32,
         shm_region: &VirtioShmRegion,
@@ -844,7 +854,7 @@ impl VirtioGpu {
             // SHM and DMABUF are both regular host fds whose pages can be exposed
             // to the guest by mmap'ing them directly into the virtio shm region.
             // For SHM (memfd) this has always worked. For DMABUF it had been
-            // delegated to virgl_renderer_resource_map2, which only handles
+            // delegated to virgl_renderer_resource_map_fixed, which only handles
             // virglrenderer-allocated GPU memory and silently no-ops for external
             // dma-bufs — leaving the guest blob backed by zero pages. That broke
             // muvm camera capture, where the v4l2 source exports kernel buffers

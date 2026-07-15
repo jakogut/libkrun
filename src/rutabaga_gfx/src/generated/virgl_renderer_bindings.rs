@@ -378,13 +378,6 @@ unsafe extern "C" {
         out_size: *mut u64,
     ) -> ::std::os::raw::c_int;
 }
-#[cfg(feature = "virgl_resource_map2")]
-unsafe extern "C" {
-    pub fn virgl_renderer_resource_map_fixed(
-        res_handle: u32,
-        map: *const ::std::os::raw::c_void,
-    ) -> ::std::os::raw::c_int;
-}
 unsafe extern "C" {
     pub fn virgl_renderer_resource_unmap(res_handle: u32) -> ::std::os::raw::c_int;
 }

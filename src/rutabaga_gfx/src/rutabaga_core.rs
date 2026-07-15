@@ -67,6 +67,11 @@ pub struct RutabagaResource {
 /// Most methods return a `RutabagaResult` that indicate the success, failure, or requested data for
 /// the given command.
 pub trait RutabagaComponent {
+    /// Returns whether the component supports fixed-address resource mappings.
+    fn supports_resource_map(&self) -> bool {
+        false
+    }
+
     /// Implementations should return the version and size of the given capset_id.  (0, 0) is
     /// returned by default.
     fn get_capset_info(&self, _capset_id: u32) -> (u32, u32) {
@@ -360,6 +365,13 @@ pub struct Rutabaga {
 }
 
 impl Rutabaga {
+    /// Returns whether the default component supports fixed-address resource mappings.
+    pub fn supports_resource_map(&self) -> bool {
+        self.components
+            .get(&self.default_component)
+            .is_some_and(|component| component.supports_resource_map())
+    }
+
     /// Take a snapshot of Rutabaga's current state. The snapshot is serialized into an opaque byte
     /// stream and written to `w`.
     ///
