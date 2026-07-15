@@ -902,6 +902,8 @@ impl VirtioGpu {
             } else {
                 return Err(ErrUnspec);
             }
+        } else {
+            mapping::resource_map_fixed(resource_id, addr)?;
         }
 
         resource.shmem_offset = Some(offset);
