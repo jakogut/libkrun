@@ -44,6 +44,21 @@ use crate::virtio::fs::ExportTable;
 use crate::virtio::gpu::protocol::VIRTIO_GPU_FLAG_INFO_RING_IDX;
 use crate::virtio::{InterruptTransport, VirtioShmRegion};
 
+#[cfg(target_os = "linux")]
+fn restore_anonymous_mapping(addr: u64, size: u64) {
+    let ret = unsafe {
+        libc::mmap(
+            addr as *mut libc::c_void,
+            size as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_FIXED,
+            -1,
+            0_i64,
+        )
+    };
+    assert_ne!(ret, libc::MAP_FAILED, "UNMAP failed");
+}
+
 fn sglist_to_rutabaga_iovecs(
     vecs: &[(GuestAddress, usize)],
     mem: &GuestMemoryMmap,
@@ -965,19 +980,7 @@ impl VirtioGpu {
 
         let addr = shm_region.host_addr + shmem_offset;
 
-        let ret = unsafe {
-            libc::mmap(
-                addr as *mut libc::c_void,
-                resource.size as usize,
-                libc::PROT_NONE,
-                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_FIXED,
-                -1,
-                0_i64,
-            )
-        };
-        if ret == libc::MAP_FAILED {
-            panic!("UNMAP failed");
-        }
+        restore_anonymous_mapping(addr, resource.size);
 
         resource.shmem_offset = None;
 
@@ -1023,6 +1026,32 @@ impl VirtioGpu {
 #[cfg(test)]
 mod test {
     use crate::virtio::gpu::protocol::VIRTIO_GPU_MAX_SCANOUTS;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_restore_anonymous_mapping() {
+        let size = 4096;
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(addr, libc::MAP_FAILED);
+
+        let byte = addr.cast::<u8>();
+        unsafe { byte.write(0xff) };
+        super::restore_anonymous_mapping(addr as u64, size as u64);
+        assert_eq!(unsafe { byte.read() }, 0);
+        unsafe { byte.write(0x5a) };
+        assert_eq!(unsafe { byte.read() }, 0x5a);
+
+        assert_eq!(unsafe { libc::munmap(addr, size) }, 0);
+    }
 
     #[test]
     fn test_virtio_gpu_associated_scanouts() {
