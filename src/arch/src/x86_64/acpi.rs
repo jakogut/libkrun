@@ -1,6 +1,7 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::ops::Range;
 use std::result;
 
 use acpi_tables::Aml;
@@ -52,6 +53,8 @@ pub struct PciHostInfo {
     pub bar_start: u64,
     pub bar_size: u64,
     pub functions: Vec<PciFunctionInfo>,
+    pub high_window: Option<Range<u64>>,
+    pub io_window: Option<Range<u64>>,
 }
 
 /// Builds a 36-byte ACPI 2.0+ RSDP pointing at the given XSDT address.
@@ -121,10 +124,27 @@ fn build_dsdt(virtio_mmio_devices: &[(u64, u32)], pci_host: Option<&PciHostInfo>
             pci_host.bar_start + pci_host.bar_size - 1,
             None,
         );
-        let crs = Name::new(
-            Path::new("_CRS"),
-            &ResourceTemplate::new(vec![&buses, &memory]),
-        );
+        let high_memory = pci_host.high_window.as_ref().map(|window| {
+            AddressSpace::new_memory(
+                AddressSpaceCacheable::NotCacheable,
+                true,
+                window.start,
+                window.end - 1,
+                None,
+            )
+        });
+        let io = pci_host
+            .io_window
+            .as_ref()
+            .map(|window| AddressSpace::new_io(window.start as u16, (window.end - 1) as u16, None));
+        let mut resources: Vec<&dyn Aml> = vec![&buses, &memory];
+        if let Some(high) = &high_memory {
+            resources.push(high);
+        }
+        if let Some(io) = &io {
+            resources.push(io);
+        }
+        let crs = Name::new(Path::new("_CRS"), &ResourceTemplate::new(resources));
 
         let mut prt = PackageBuilder::new();
         for function in &pci_host.functions {
@@ -410,6 +430,8 @@ mod tests {
     #[test]
     fn pci_dsdt_contains_root_bridge_and_interrupt_routes() {
         let pci_host = PciHostInfo {
+            high_window: None,
+            io_window: None,
             ecam_base: 0xe000_0000,
             bar_start: 0xe010_0000,
             bar_size: 0x1eb0_0000,
@@ -430,8 +452,39 @@ mod tests {
     }
 
     #[test]
+    fn pci_dsdt_describes_io_and_64_bit_windows() {
+        let host = PciHostInfo {
+            ecam_base: 0xe000_0000,
+            bar_start: 0xe010_0000,
+            bar_size: 0x1eb0_0000,
+            functions: vec![],
+            high_window: Some(0x8_0000_0000..0x8_4000_0000),
+            io_window: Some(0xc000..0xe000),
+        };
+        let table = build_dsdt(&[], Some(&host));
+        assert!(
+            table
+                .windows(8)
+                .any(|v| v == 0x8_0000_0000u64.to_le_bytes())
+        );
+        assert!(
+            table
+                .windows(8)
+                .any(|v| v == 0x8_3fff_ffffu64.to_le_bytes())
+        );
+        assert!(table.windows(2).any(|v| v == 0xc000u16.to_le_bytes()));
+        assert!(table.windows(2).any(|v| v == 0xdfffu16.to_le_bytes()));
+        assert_eq!(
+            table.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
+            0
+        );
+    }
+
+    #[test]
     fn mcfg_contains_bus_zero_ecam_and_valid_checksum() {
         let pci_host = PciHostInfo {
+            high_window: None,
+            io_window: None,
             ecam_base: 0xe000_0000,
             bar_start: 0xe010_0000,
             bar_size: 0x1eb0_0000,
@@ -512,6 +565,8 @@ mod tests {
         let window_size = (HIMEM_START - RSDP_ADDR) as usize;
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(RSDP_ADDR), window_size)]).unwrap();
         let pci_host = PciHostInfo {
+            high_window: None,
+            io_window: None,
             ecam_base: 0xe000_0000,
             bar_start: 0xe010_0000,
             bar_size: 0x1eb0_0000,

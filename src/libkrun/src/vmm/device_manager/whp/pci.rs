@@ -147,6 +147,8 @@ impl PciHostManager {
 
     pub fn acpi_info(&self) -> arch::x86_64::PciHostInfo {
         arch::x86_64::PciHostInfo {
+            high_window: None,
+            io_window: None,
             ecam_base: arch::x86_64::layout::PCI_ECAM_START,
             bar_start: arch::x86_64::layout::PCI_BAR_START,
             bar_size: arch::x86_64::layout::PCI_BAR_END - arch::x86_64::layout::PCI_BAR_START,
