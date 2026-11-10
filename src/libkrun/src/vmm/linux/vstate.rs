@@ -12,7 +12,6 @@ use libc::{c_int, c_void, siginfo_t};
 use std::cell::Cell;
 use std::fmt::{Display, Formatter};
 use std::io;
-#[cfg(all(feature = "tee", target_arch = "x86_64"))]
 use std::ops::Range;
 
 #[cfg(all(feature = "tee", target_arch = "x86_64"))]
@@ -479,6 +478,7 @@ impl KvmContext {
 pub struct Vm {
     fd: Arc<VmFd>,
     next_mem_slot: u32,
+    max_mem_slots: u32,
 
     // X86 specific fields.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -514,6 +514,7 @@ impl Vm {
         Ok(Vm {
             fd: Arc::new(vm_fd),
             next_mem_slot: 0,
+            max_mem_slots: 0,
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             supported_cpuid,
             #[cfg(target_arch = "x86_64")]
@@ -552,6 +553,7 @@ impl Vm {
         Ok(Vm {
             fd: Arc::new(vm_fd),
             next_mem_slot: 0,
+            max_mem_slots: 0,
             supported_cpuid,
             supported_msrs,
             tee,
@@ -596,6 +598,7 @@ impl Vm {
         Ok(Vm {
             fd: Arc::new(vm_fd),
             next_mem_slot: 0,
+            max_mem_slots: 0,
             supported_cpuid,
             supported_msrs,
             tdx: Some(IntelTdx::new()),
@@ -645,6 +648,7 @@ impl Vm {
             return Err(Error::NotEnoughMemorySlots);
         }
 
+        self.max_mem_slots = kvm_max_memslots as u32;
         for region in guest_mem.iter() {
             self.memory_region_set(guest_mem, region)?;
         }
@@ -773,6 +777,17 @@ impl Vm {
         Err(Error::InvalidTee)
     }
 
+    pub(crate) fn reserve_memory_slots(&mut self, count: u32) -> Result<Range<u32>> {
+        let end = self
+            .next_mem_slot
+            .checked_add(count)
+            .filter(|end| *end <= self.max_mem_slots)
+            .ok_or(Error::NotEnoughMemorySlots)?;
+        let slots = self.next_mem_slot..end;
+        self.next_mem_slot = end;
+        Ok(slots)
+    }
+
     fn memory_region_set(
         &mut self,
         guest_mem: &GuestMemoryMmap,
@@ -783,7 +798,7 @@ impl Vm {
 
         self.create_guest_physical_memory_slot(host_addr, start, region)?;
 
-        self.next_mem_slot += 1;
+        self.reserve_memory_slots(1)?;
 
         Ok(())
     }
@@ -1914,6 +1929,18 @@ mod tests {
             // Wait for the Vcpu thread to finish execution
             self.vcpu_thread.take().unwrap().join().unwrap();
         }
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn memory_slot_reservations_are_bounded() {
+        let kvm = KvmContext::new().unwrap();
+        let mut vm = Vm::new(kvm.fd()).unwrap();
+        vm.max_mem_slots = 3;
+        assert_eq!(vm.reserve_memory_slots(2).unwrap(), 0..2);
+        assert!(vm.reserve_memory_slots(2).is_err());
+        assert_eq!(vm.reserve_memory_slots(1).unwrap(), 2..3);
+        assert!(vm.reserve_memory_slots(u32::MAX).is_err());
     }
 
     // Auxiliary function being used throughout the tests.
