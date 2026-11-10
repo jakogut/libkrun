@@ -40,7 +40,7 @@ Conventional configuration reads use live VFIO state. Guest BAR addresses, capab
 
 Hidden capabilities are non-writable. Known lengths bound their protected ranges. An opaque capability protects the space up to the next capability at a higher offset, or the end of conventional configuration space. Vendor registers in such a gap require additional capability knowledge or a device quirk.
 
-BARs may move only within the span reserved for this function's BARs of the same kind. Overlapping or out-of-range BAR addresses disable BAR access. I/O and memory decode are independent, and both require the PM state read back from VFIO to be D0. Accessible BAR reads and writes trap to VFIO.
+BARs may move only within the span reserved for this function's BARs of the same kind. Overlapping or out-of-range BAR addresses disable BAR access. I/O and memory decode are independent, and both require the PM state read back from VFIO to be D0. BAR accesses use VFIO, with optional memory mapping as described below.
 
 The compatibility contract covers standard PCI configuration and interrupt access paths. Devices whose drivers require configuration or interrupt-table aliases through BARs are outside this scope. PCIe capability version zero and device-specific MSI-X pending-bit-array errata are not corrected. Malformed capability and region metadata remain errors. This is not a claim that every GPU, NIC, or host-created virtual function works. Device reset/recovery and surprise physical removal require separate qualification and handling.
 
@@ -49,3 +49,9 @@ The compatibility contract covers standard PCI configuration and interrupt acces
 INTx uses the in-kernel IOAPIC. An exposed MSI capability offers one vector and requires a reported host MSI vector and a guest GSI route at attachment. MSI address, data, enable, and mask writes are emulated even when a byte, word, or dword access also touches a capability header or reserved bytes. Masked events stay pending and are delivered when unmasked. Host activation must succeed before the mode becomes active or guest irqfds are registered. A later access failure stops the VM with a nonzero exit status.
 
 MSI-X emulates the full table and pending-bit array (PBA), including vector and function masks. The table and PBA obey the same D0 and memory-decode gate as other memory BAR accesses. Attachment requires at least the table's reported host vector count and one guest GSI route per vector. Enabling MSI-X also requires actual allocation of the entire table on the host. A positive allocation result means insufficient vectors, not success. Allocation failure stops the VM with a nonzero exit status through the device error path. Dynamic vector allocation is deferred.
+
+## BAR mapping
+
+Mmap-capable memory BAR pages can use KVM memory slots for direct guest access. Sparse mapping metadata limits which pages may be mapped, and pages containing the MSI-X table or PBA always trap. Slots are installed only with valid guest BAR addresses, memory decode enabled, and backend-visible D0 state. Writes to Command or PM control remove slots before backend I/O, and slots return only after a successful write and readback. Relocation removes all stale slots before installing new ones.
+
+Host mmap failure, slot exhaustion, or KVM installation failure disables further acceleration for that BAR. After all its installed slots are removed, accesses fall back to trapped VFIO I/O. The fallback is logged once. Reserved slot numbers are not recycled until VM destruction. Malformed sparse-map metadata remains fatal. Failure to remove a live KVM slot is also fatal. Backing memory is retained to prevent a live slot from referencing released memory.

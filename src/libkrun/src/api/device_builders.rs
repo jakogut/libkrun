@@ -55,6 +55,7 @@ use {
     devices::pci::{PciAddress, PciFunction},
     kvm_ioctls::VmFd,
     std::io,
+    std::ops::Range,
     utils::eventfd::EventFd,
     vm_memory::GuestAddress,
 };
@@ -332,6 +333,13 @@ impl AttachContext<'_> {
     /// The VM's GSI routing table, unless a userspace irqchip owns it.
     pub(crate) fn gsi_routing(&self) -> Option<Arc<Mutex<GsiRouting>>> {
         self.vmm.gsi_routing.clone()
+    }
+
+    pub(crate) fn reserve_memory_slots(&mut self, count: u32) -> Result<Range<u32>, VmmError> {
+        self.vmm
+            .vm
+            .reserve_memory_slots(count)
+            .map_err(|e| VmmError::Internal(e.to_string()))
     }
 
     fn pci_host(&mut self) -> &mut PciHostManager {

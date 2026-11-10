@@ -4,7 +4,9 @@
 use crate::api::AttachContext;
 mod config;
 mod irq;
+mod mapping;
 use irq::set_irq_eventfds;
+use mapping::{Mapping, mapping_ranges, prepare_bar, set_memory, write_quiesced};
 mod pci_regs;
 use crate::vmm::device_manager::pci::PciBarKind;
 use crate::vmm::gsi_routing::GsiRouting;
@@ -25,10 +27,10 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicI32, Ordering},
 };
-use std::{array, mem};
+use std::{array, mem, ptr};
 use utils::eventfd::EventFd;
 use vfio_bindings::bindings::vfio::*;
-use vfio_ioctls::{VfioContainer, VfioDevice, VfioDeviceFd};
+use vfio_ioctls::{VfioContainer, VfioDevice, VfioDeviceFd, VfioRegionInfoCap};
 use vm_memory::{Address, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
 
 const CONFIG_SIZE: usize = PCI_EXTENDED_CONFIG_SPACE_SIZE as usize;
@@ -694,6 +696,7 @@ pub(crate) struct VfioPci {
     config: [u8; CONFIG_SIZE],
     bars: Vec<Bar>,
     access: ConfigAccess,
+    mappings: Vec<Mapping>,
     dma: Vec<(u64, usize)>,
     pub(crate) address: PciAddress,
     exit_evt: EventFd,
@@ -718,23 +721,23 @@ impl VfioPci {
     fn container(&self) -> &VfioContainer {
         &self.vfio.as_ref().unwrap().1
     }
-    fn region_offset(&self, region: u32, offset: u64, length: usize) -> io::Result<i64> {
-        if !contains(
-            0,
-            self.device().get_region_size(region),
-            offset,
-            length as u64,
-        ) {
+    fn region_offset(
+        device: &VfioDevice,
+        region: u32,
+        offset: u64,
+        length: usize,
+    ) -> io::Result<i64> {
+        if !contains(0, device.get_region_size(region), offset, length as u64) {
             return Err(io::Error::other("VFIO access exceeds region"));
         }
-        self.device()
+        device
             .get_region_offset(region)
             .checked_add(offset)
             .and_then(|offset| i64::try_from(offset).ok())
             .ok_or_else(|| io::Error::other("VFIO offset overflow"))
     }
     fn io_read(&self, region: u32, offset: u64, data: &mut [u8]) -> io::Result<()> {
-        let offset = self.region_offset(region, offset, data.len())?;
+        let offset = Self::region_offset(self.device(), region, offset, data.len())?;
         let count = unsafe {
             libc::pread(
                 self.device().as_raw_fd(),
@@ -745,16 +748,10 @@ impl VfioPci {
         };
         transferred(count, data.len(), "read")
     }
-    fn io_write(&self, region: u32, offset: u64, data: &[u8]) -> io::Result<()> {
-        let offset = self.region_offset(region, offset, data.len())?;
-        let count = unsafe {
-            libc::pwrite(
-                self.device().as_raw_fd(),
-                data.as_ptr().cast(),
-                data.len(),
-                offset,
-            )
-        };
+    fn io_write(device: &VfioDevice, region: u32, offset: u64, data: &[u8]) -> io::Result<()> {
+        let offset = Self::region_offset(device, region, offset, data.len())?;
+        let count =
+            unsafe { libc::pwrite(device.as_raw_fd(), data.as_ptr().cast(), data.len(), offset) };
         transferred(count, data.len(), "write")
     }
     pub(crate) fn new(host_bdf: &str, ctx: &mut AttachContext) -> io::Result<Self> {
@@ -783,6 +780,7 @@ impl VfioPci {
             config: [0; CONFIG_SIZE],
             bars: Vec::new(),
             access: ConfigAccess::new(),
+            mappings: Vec::new(),
             dma: Vec::new(),
             address,
             irq,
@@ -813,7 +811,8 @@ impl VfioPci {
         {
             return Err(io::Error::other("VFIO requires a PCI endpoint"));
         }
-        self.io_write(
+        Self::io_write(
+            self.device(),
             VFIO_PCI_CONFIG_REGION_INDEX,
             PCI_COMMAND as u64,
             &0u16.to_le_bytes(),
@@ -872,7 +871,69 @@ impl VfioPci {
             })?;
             self.dma.push((address, size));
         }
+        self.map_bars(ctx)?;
         self.update_interrupts()
+    }
+    fn map_bars(&mut self, ctx: &mut AttachContext) -> io::Result<()> {
+        for bar in &self.bars {
+            if bar.io()
+                || self.device().get_region_flags(bar.index as u32) & VFIO_REGION_INFO_FLAG_MMAP
+                    == 0
+            {
+                continue;
+            }
+            let caps = self.device().get_region_caps(bar.index as u32);
+            let sparse = caps.iter().find_map(|cap| {
+                if let VfioRegionInfoCap::SparseMmap(sparse) = cap {
+                    Some(&sparse.areas)
+                } else {
+                    None
+                }
+            });
+            let areas = sparse.map_or_else(
+                || {
+                    if bar.size < PAGE_SIZE {
+                        vec![]
+                    } else {
+                        vec![(0, bar.size & !(PAGE_SIZE - 1))]
+                    }
+                },
+                |areas| areas.iter().map(|a| (a.offset, a.size)).collect(),
+            );
+            let pieces = mapping_ranges(bar, &areas, self.msix.as_ref())?;
+            let mappings = prepare_bar(
+                bar.index,
+                &pieces,
+                |count| ctx.reserve_memory_slots(count).map_err(io::Error::other),
+                |start, size| {
+                    let offset =
+                        Self::region_offset(self.device(), bar.index as u32, start, size as usize)?;
+                    let address = unsafe {
+                        libc::mmap(
+                            ptr::null_mut(),
+                            size as usize,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                            libc::MAP_SHARED,
+                            self.device().as_raw_fd(),
+                            offset,
+                        )
+                    };
+                    if address == libc::MAP_FAILED {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(address as usize)
+                    }
+                },
+            );
+            self.mappings.extend(mappings);
+        }
+        Ok(())
+    }
+    fn update_mappings(&mut self) -> io::Result<()> {
+        let enabled = self.access.decoding(&self.config, PCI_COMMAND_MEMORY) && self.bars_valid();
+        mapping::update(&mut self.mappings, &self.bars, enabled, |region| {
+            set_memory(&self.vm, region)
+        })
     }
     fn bars_valid(&self) -> bool {
         self.bars.iter().all(|bar| bar.bounds())
@@ -1014,7 +1075,12 @@ impl VfioPci {
             return Ok(());
         }
         let mut errors = Vec::new();
-        if let Err(e) = self.io_write(
+        // The host can revoke BAR backing when command bits are cleared.
+        if let Err(e) = release_all(&mut self.mappings, |mapping| mapping.unmap(&self.vm)) {
+            errors.push(format!("unmap BAR: {e}"));
+        }
+        if let Err(e) = Self::io_write(
+            self.device(),
             VFIO_PCI_CONFIG_REGION_INDEX,
             PCI_COMMAND as u64,
             &0u16.to_le_bytes(),
@@ -1040,13 +1106,24 @@ impl VfioPci {
         }
     }
     fn emulate_config_write(&mut self, start: usize, data: &[u8]) -> io::Result<()> {
-        self.access.write(start, data, |offset, bytes| {
-            self.io_write(VFIO_PCI_CONFIG_REGION_INDEX, offset as u64, bytes)
-        })?;
+        let device = &self.vfio.as_ref().unwrap().0;
+        let decode = self.access.affects_decode(start, data.len());
+        // Command and PM writes can be filtered by VFIO. Quiesce first and
+        // restore slots only after a successful write and backend readback.
+        write_quiesced(
+            &mut self.mappings,
+            decode,
+            |region| set_memory(&self.vm, region),
+            || {
+                self.access.write(start, data, |offset, bytes| {
+                    Self::io_write(device, VFIO_PCI_CONFIG_REGION_INDEX, offset as u64, bytes)
+                })
+            },
+        )?;
         let mut config = self.config;
         self.access.emulate(&mut config, start, data);
         write_bars(&mut config, &mut self.bars, start, data);
-        if self.access.affects_decode(start, data.len()) {
+        if decode {
             self.access.read_controls(&mut config, |offset, bytes| {
                 self.io_read(VFIO_PCI_CONFIG_REGION_INDEX, offset as u64, bytes)
             })?;
@@ -1054,6 +1131,7 @@ impl VfioPci {
             return Ok(());
         }
         self.config = config;
+        self.update_mappings()?;
         self.update_interrupts()
     }
     fn failure(&mut self, result: io::Result<()>) {
@@ -1080,7 +1158,7 @@ impl Drop for VfioPci {
     fn drop(&mut self) {
         if let Err(error) = self.shutdown() {
             log::error!("VFIO cleanup: {error}; retaining mappings until process exit");
-            // DMA must not outlive its backing memory, so fail closed.
+            // Neither DMA nor a KVM slot may outlive its backing, so fail closed.
             mem::forget(self.mem.clone());
             mem::forget(self.vm.clone());
             mem::forget(self.vfio.take());
@@ -1204,7 +1282,7 @@ impl PciFunction for VfioPci {
                 Ok(())
             }
         } else {
-            if let Err(error) = self.io_write(bar as u32, offset, data) {
+            if let Err(error) = Self::io_write(self.device(), bar as u32, offset, data) {
                 log::debug!("VFIO BAR {bar} write at {offset:#x}: {error}");
             }
             Ok(())
@@ -1623,6 +1701,26 @@ mod tests {
                 3 | PCI_MSIX_FLAGS_ENABLE | PCI_MSIX_FLAGS_MASKALL
             );
             assert_eq!(&config[0x44..0x58], &old[0x44..0x58]);
+        }
+    }
+
+    #[test]
+    fn vfio_sparse_mappings_trap_table_and_pending_pages() {
+        let bar = test_bar();
+        let msix = test_msix();
+        assert_eq!(
+            mapping_ranges(&bar, &[(0, 0x8000)], Some(&msix)).unwrap(),
+            [(0, 0x1000), (0x3000, 0x1000), (0x5000, 0x3000)]
+        );
+        assert_eq!(mapping_ranges(&bar, &[], None).unwrap(), []);
+        for areas in [
+            vec![(1, 4096)],
+            vec![(0, 0)],
+            vec![(0, 8192), (4096, 4096)],
+            vec![(0x7000, 8192)],
+            vec![(u64::MAX - 4095, 4096)],
+        ] {
+            assert!(mapping_ranges(&bar, &areas, None).is_err());
         }
     }
 }
