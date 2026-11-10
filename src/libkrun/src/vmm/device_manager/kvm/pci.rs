@@ -4,11 +4,14 @@
 //! PCI root and virtio-pci registration for the x86_64 KVM backend.
 
 use std::fmt::{Display, Formatter};
+use std::io;
 use std::sync::{Arc, Mutex};
 
+use arch::x86_64::layout::{PCI_BAR_END, PCI_BAR_START, PCI_ECAM_SIZE, PCI_ECAM_START};
 use devices::Bus;
 use devices::pci::{
-    BarWindow, ConfigMechanism1, Ecam, PciAddress, PciFunction, PciIntxLine, PciRootError,
+    BarWindow, ConfigMechanism1, Ecam, PciAddress, PciFunction, PciIntxLine, PciResourceWindow,
+    PciRootError,
 };
 use devices::virtio::{
     CreatePciTransportError, VIRTIO_PCI_BAR0_SIZE, VirtioDevice, VirtioPciTransport,
@@ -26,6 +29,7 @@ pub enum Error {
     CreateTransport(CreatePciTransportError),
     IrqsExhausted,
     PciRoot(PciRootError),
+    Resource(io::Error),
 }
 
 impl Display for Error {
@@ -35,6 +39,7 @@ impl Display for Error {
             Self::CreateTransport(err) => write!(f, "failed to create virtio-pci transport: {err}"),
             Self::IrqsExhausted => write!(f, "no more GSIs are available for PCI INTx"),
             Self::PciRoot(err) => write!(f, "failed to register PCI function: {err}"),
+            Self::Resource(err) => write!(f, "failed to allocate PCI resource: {err}"),
         }
     }
 }
@@ -47,6 +52,7 @@ pub struct PciHostManager {
     next_device: u8,
     irqs: IrqAllocator,
     functions: Vec<arch::x86_64::PciFunctionInfo>,
+    mmio32: PciResourceWindow,
 }
 
 struct KvmPciIntxLine {
@@ -69,6 +75,7 @@ impl PciHostManager {
             next_device: 1,
             irqs,
             functions: Vec::new(),
+            mmio32: PciResourceWindow::new(PCI_BAR_START..PCI_BAR_END),
         }
     }
 
@@ -84,17 +91,14 @@ impl PciHostManager {
     pub fn register_mmio(&self, bus: &mut Bus) -> Result<()> {
         bus.insert(
             Arc::new(Mutex::new(Ecam::new(self.root.clone()))),
-            arch::x86_64::layout::PCI_ECAM_START,
-            arch::x86_64::layout::PCI_ECAM_SIZE,
+            PCI_ECAM_START,
+            PCI_ECAM_SIZE,
         )
         .map_err(Error::Bus)?;
         bus.insert(
-            Arc::new(Mutex::new(BarWindow::new(
-                self.root.clone(),
-                arch::x86_64::layout::PCI_BAR_START,
-            ))),
-            arch::x86_64::layout::PCI_BAR_START,
-            arch::x86_64::layout::PCI_BAR_END - arch::x86_64::layout::PCI_BAR_START,
+            Arc::new(Mutex::new(BarWindow::new(self.root.clone(), PCI_BAR_START))),
+            PCI_BAR_START,
+            PCI_BAR_END - PCI_BAR_START,
         )
         .map_err(Error::Bus)
     }
@@ -110,11 +114,10 @@ impl PciHostManager {
         }
 
         let address = PciAddress::new(PCI_BUS0, self.next_device, 0);
-        let bar_base = arch::x86_64::layout::PCI_BAR_START
-            + u64::from(self.next_device - 1) * VIRTIO_PCI_BAR0_SIZE;
-        if bar_base + VIRTIO_PCI_BAR0_SIZE > arch::x86_64::layout::PCI_BAR_END {
-            return Err(Error::IrqsExhausted);
-        }
+        let bar_base = self
+            .mmio32
+            .allocate(VIRTIO_PCI_BAR0_SIZE)
+            .map_err(Error::Resource)?;
         let irq = self.irqs.alloc().map_err(|_| Error::IrqsExhausted)?;
         let intx_line = Arc::new(KvmPciIntxLine { vm, gsi: irq });
         let transport =
@@ -140,9 +143,9 @@ impl PciHostManager {
 
     pub fn acpi_info(&self) -> arch::x86_64::PciHostInfo {
         arch::x86_64::PciHostInfo {
-            ecam_base: arch::x86_64::layout::PCI_ECAM_START,
-            bar_start: arch::x86_64::layout::PCI_BAR_START,
-            bar_size: arch::x86_64::layout::PCI_BAR_END - arch::x86_64::layout::PCI_BAR_START,
+            ecam_base: PCI_ECAM_START,
+            bar_start: PCI_BAR_START,
+            bar_size: PCI_BAR_END - PCI_BAR_START,
             functions: self.functions.clone(),
         }
     }
