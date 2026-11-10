@@ -9,6 +9,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::bus::BusDevice;
 
+mod resources;
+pub use resources::PciResourceWindow;
+
 pub const PCI_CONVENTIONAL_CONFIG_SPACE_SIZE: usize = 256;
 pub const PCI_EXTENDED_CONFIG_SPACE_SIZE: u64 = 1 << 12;
 pub(crate) const PCI_UNIMPLEMENTED_READ_BYTE: u8 = u8::MAX;
