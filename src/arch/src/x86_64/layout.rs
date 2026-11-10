@@ -88,5 +88,8 @@ pub const PCI_ECAM_START: u64 = 0xe000_0000;
 pub const PCI_ECAM_SIZE: u64 = 1 << 20;
 /// Start of the PCI memory BAR allocation window.
 pub const PCI_BAR_START: u64 = PCI_ECAM_START + PCI_ECAM_SIZE;
+/// PCI I/O BAR window, disjoint from legacy device ports.
+pub const PCI_IO_START: u64 = 0xc000;
+pub const PCI_IO_END: u64 = 0xe000;
 /// Exclusive end of the PCI memory BAR allocation window, below the IOAPIC.
 pub const PCI_BAR_END: u64 = 0xfec0_0000;

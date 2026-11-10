@@ -5,9 +5,12 @@
 
 use std::fmt::{Display, Formatter};
 use std::io;
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
-use arch::x86_64::layout::{PCI_BAR_END, PCI_BAR_START, PCI_ECAM_SIZE, PCI_ECAM_START};
+use arch::x86_64::layout::{
+    PCI_BAR_END, PCI_BAR_START, PCI_ECAM_SIZE, PCI_ECAM_START, PCI_IO_END, PCI_IO_START,
+};
 use devices::Bus;
 use devices::pci::{
     BarWindow, ConfigMechanism1, Ecam, PciAddress, PciFunction, PciIntxLine, PciResourceWindow,
@@ -52,7 +55,9 @@ pub struct PciHostManager {
     next_device: u8,
     irqs: IrqAllocator,
     functions: Vec<arch::x86_64::PciFunctionInfo>,
+    io: PciResourceWindow,
     mmio32: PciResourceWindow,
+    mmio64: PciResourceWindow,
 }
 
 struct KvmPciIntxLine {
@@ -69,17 +74,30 @@ impl PciIntxLine for KvmPciIntxLine {
 }
 
 impl PciHostManager {
-    pub fn new(irqs: IrqAllocator) -> Self {
+    /// `high_window` is the guest-physical range for 64-bit BARs, if any.
+    pub fn new(irqs: IrqAllocator, high_window: Option<Range<u64>>) -> Self {
         Self {
             root: devices::pci::PciRoot::shared(),
             next_device: 1,
             irqs,
             functions: Vec::new(),
+            io: PciResourceWindow::new(PCI_IO_START..PCI_IO_END),
             mmio32: PciResourceWindow::new(PCI_BAR_START..PCI_BAR_END),
+            mmio64: PciResourceWindow::new(high_window.unwrap_or(0..0)),
         }
     }
 
+    fn insert_bar_window(&self, bus: &mut Bus, window: Range<u64>) -> Result<()> {
+        bus.insert(
+            Arc::new(Mutex::new(BarWindow::new(self.root.clone(), window.start))),
+            window.start,
+            window.end - window.start,
+        )
+        .map_err(Error::Bus)
+    }
+
     pub fn register_config_io(&self, bus: &mut Bus) -> Result<()> {
+        self.insert_bar_window(bus, self.io.range())?;
         bus.insert(
             Arc::new(Mutex::new(ConfigMechanism1::new(self.root.clone()))),
             devices::pci::CONFIG_MECHANISM_1_ADDRESS,
@@ -89,18 +107,17 @@ impl PciHostManager {
     }
 
     pub fn register_mmio(&self, bus: &mut Bus) -> Result<()> {
+        let high = self.mmio64.range();
+        if !high.is_empty() {
+            self.insert_bar_window(bus, high)?;
+        }
         bus.insert(
             Arc::new(Mutex::new(Ecam::new(self.root.clone()))),
             PCI_ECAM_START,
             PCI_ECAM_SIZE,
         )
         .map_err(Error::Bus)?;
-        bus.insert(
-            Arc::new(Mutex::new(BarWindow::new(self.root.clone(), PCI_BAR_START))),
-            PCI_BAR_START,
-            PCI_BAR_END - PCI_BAR_START,
-        )
-        .map_err(Error::Bus)
+        self.insert_bar_window(bus, self.mmio32.range())
     }
 
     pub fn register_virtio_device(
@@ -142,12 +159,14 @@ impl PciHostManager {
     }
 
     pub fn acpi_info(&self) -> arch::x86_64::PciHostInfo {
+        let high = self.mmio64.range();
+        let mmio32 = self.mmio32.range();
         arch::x86_64::PciHostInfo {
-            high_window: None,
-            io_window: None,
+            high_window: (!high.is_empty()).then_some(high),
+            io_window: Some(self.io.range()),
             ecam_base: PCI_ECAM_START,
-            bar_start: PCI_BAR_START,
-            bar_size: PCI_BAR_END - PCI_BAR_START,
+            bar_start: mmio32.start,
+            bar_size: mmio32.end - mmio32.start,
             functions: self.functions.clone(),
         }
     }
@@ -232,7 +251,7 @@ mod tests {
 
         let irqs = IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX);
         let mut mmio = MMIODeviceManager::new(&mut 0xd000_0000, irqs.clone());
-        let mut pci = PciHostManager::new(irqs);
+        let mut pci = PciHostManager::new(irqs, None);
 
         // Same order as build_microvm(): an MMIO device (the RTC) is attached
         // before the PCI devices.
@@ -258,6 +277,17 @@ mod tests {
     }
 
     #[test]
+    fn test_pci_acpi_info_describes_resource_windows() {
+        let irqs = IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX);
+        let info = PciHostManager::new(irqs.clone(), None).acpi_info();
+        assert_eq!(info.high_window, None);
+        assert_eq!(info.io_window, Some(PCI_IO_START..PCI_IO_END));
+        assert_eq!(info.bar_start, PCI_BAR_START);
+        let info = PciHostManager::new(irqs, Some(1 << 36..1 << 37)).acpi_info();
+        assert_eq!(info.high_window, Some(1 << 36..1 << 37));
+    }
+
+    #[test]
     fn test_pci_reports_exhausted_shared_irqs() {
         let guest_mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0x0), 0x1000)]).unwrap();
         let mut arch_mem_info = arch::ArchMemoryInfo::default();
@@ -266,7 +296,7 @@ mod tests {
         let irqs = IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_BASE);
         // Another manager already took the only IRQ.
         irqs.alloc().unwrap();
-        let mut pci = PciHostManager::new(irqs);
+        let mut pci = PciHostManager::new(irqs, None);
 
         let err = pci
             .register_virtio_device(vm.fd_shared(), guest_mem, dummy_device())
