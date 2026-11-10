@@ -32,6 +32,9 @@ jobs:
       - name: Clippy (aws-nitro+net)
         run: cargo clippy --locked --features aws-nitro,net -- -D warnings
 
+      - name: Clippy (vfio)
+        run: cargo clippy --locked --features vfio -- -D warnings
+
   code-quality-linux-aarch64:
     name: libkrun (Linux aarch64)
     runs-on: ubuntu-26.04-arm

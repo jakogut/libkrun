@@ -609,6 +609,26 @@ impl Vm {
         &self.supported_cpuid
     }
 
+    #[cfg(vfio)]
+    pub(crate) fn guest_phys_bits(&self) -> u32 {
+        const DEFAULT_PHYS_BITS: u32 = 36;
+        const MAX_PHYS_BITS: u32 = 52;
+        self.supported_cpuid
+            .as_slice()
+            .iter()
+            .find(|entry| entry.function == 0x8000_0008)
+            .map_or(DEFAULT_PHYS_BITS, |entry| {
+                // KVM reports the largest GPA it can map (GuestPhysBits) when
+                // the TDP page-table depth limits it below MAXPHYADDR.
+                let phys_bits = entry.eax & 0xff;
+                match (entry.eax >> 16) & 0xff {
+                    0 => phys_bits,
+                    guest_phys_bits => guest_phys_bits.min(phys_bits),
+                }
+            })
+            .min(MAX_PHYS_BITS)
+    }
+
     /// Returns a ref to the supported `MsrList` for this Vm.
     #[cfg(target_arch = "x86_64")]
     pub fn supported_msrs(&self) -> &MsrList {

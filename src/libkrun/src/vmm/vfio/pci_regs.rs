@@ -1,0 +1,63 @@
+// Copyright 2026 The libkrun Authors.
+// SPDX-License-Identifier: Apache-2.0
+
+//! PCI configuration registers, named as in Linux's
+//! `include/uapi/linux/pci_regs.h`.
+
+pub(super) const PCI_VENDOR_ID: usize = 0x00;
+pub(super) const PCI_COMMAND: usize = 0x04;
+pub(super) const PCI_COMMAND_IO: u16 = 0x0001;
+pub(super) const PCI_COMMAND_MEMORY: u16 = 0x0002;
+pub(super) const PCI_COMMAND_MASTER: u16 = 0x0004;
+pub(super) const PCI_COMMAND_PARITY: u16 = 0x0040;
+pub(super) const PCI_COMMAND_SERR: u16 = 0x0100;
+pub(super) const PCI_COMMAND_INTX_DISABLE: u16 = 0x0400;
+pub(super) const PCI_STATUS: usize = 0x06;
+pub(super) const PCI_STATUS_CAP_LIST: u16 = 0x0010;
+pub(super) const PCI_CACHE_LINE_SIZE: usize = 0x0c;
+pub(super) const PCI_HEADER_TYPE: usize = 0x0e;
+pub(super) const PCI_HEADER_TYPE_MASK: u8 = 0x7f;
+pub(super) const PCI_HEADER_TYPE_NORMAL: u8 = 0;
+pub(super) const PCI_BASE_ADDRESS_0: usize = 0x10;
+pub(super) const PCI_BASE_ADDRESS_SPACE_IO: u32 = 0x01;
+pub(super) const PCI_BASE_ADDRESS_MEM_TYPE_MASK: u32 = 0x06;
+pub(super) const PCI_BASE_ADDRESS_MEM_TYPE_32: u32 = 0x00;
+pub(super) const PCI_BASE_ADDRESS_MEM_TYPE_64: u32 = 0x04;
+pub(super) const PCI_BASE_ADDRESS_MEM_MASK: u32 = !0x0f;
+pub(super) const PCI_BASE_ADDRESS_IO_MASK: u32 = !0x03;
+pub(super) const PCI_ROM_ADDRESS: usize = 0x30;
+pub(super) const PCI_CAPABILITY_LIST: usize = 0x34;
+pub(super) const PCI_INTERRUPT_LINE: usize = 0x3c;
+pub(super) const PCI_INTERRUPT_PIN: usize = 0x3d;
+pub(super) const PCI_STD_HEADER_SIZEOF: usize = 64;
+pub(super) const PCI_STD_NUM_BARS: usize = 6;
+pub(super) const PCI_CAP_LIST_NEXT: usize = 1;
+pub(super) const PCI_CAP_FLAGS: usize = 2;
+pub(super) const PCI_CAP_ID_PM: u8 = 0x01;
+pub(super) const PCI_CAP_ID_VPD: u8 = 0x03;
+pub(super) const PCI_CAP_ID_MSI: u8 = 0x05;
+pub(super) const PCI_CAP_ID_VNDR: u8 = 0x09;
+pub(super) const PCI_CAP_ID_EXP: u8 = 0x10;
+pub(super) const PCI_CAP_ID_MSIX: u8 = 0x11;
+pub(super) const PCI_CAP_ID_AF: u8 = 0x13;
+pub(super) const PCI_PM_CTRL: usize = 4;
+pub(super) const PCI_PM_CTRL_STATE_MASK: u16 = 0x0003;
+pub(super) const PCI_PM_SIZEOF: usize = 8;
+pub(super) const PCI_MSI_FLAGS_64BIT: u16 = 0x0080;
+pub(super) const PCI_MSI_FLAGS_MASKBIT: u16 = 0x0100;
+pub(super) const PCI_EXP_FLAGS_VERS: u16 = 0x000f;
+pub(super) const PCI_EXP_FLAGS_TYPE: u16 = 0x00f0;
+pub(super) const PCI_EXP_TYPE_ENDPOINT: u16 = 0x0;
+pub(super) const PCI_EXP_TYPE_LEG_END: u16 = 0x1;
+pub(super) const PCI_EXP_TYPE_RC_END: u16 = 0x9;
+pub(super) const PCI_EXP_DEVCAP: usize = 0x04;
+pub(super) const PCI_EXP_DEVCAP_FLR: u32 = 0x1000_0000;
+pub(super) const PCI_EXP_DEVCTL: usize = 0x08;
+pub(super) const PCI_EXP_DEVCTL_BCR_FLR: u16 = 0x8000;
+pub(super) const PCI_EXP_DEVSTA: usize = 0x0a;
+pub(super) const PCI_CAP_EXP_RC_ENDPOINT_SIZEOF_V1: usize = 0x0c;
+pub(super) const PCI_CAP_EXP_ENDPOINT_SIZEOF_V1: usize = 0x14;
+pub(super) const PCI_EXP_DEVCTL2: usize = 0x28;
+pub(super) const PCI_EXP_DEVSTA2: usize = 0x2a;
+pub(super) const PCI_CAP_EXP_RC_ENDPOINT_SIZEOF_V2: usize = 0x2c;
+pub(super) const PCI_CAP_EXP_ENDPOINT_SIZEOF_V2: usize = 0x34;

@@ -31,12 +31,16 @@ use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 
 use super::{Error, Vmm};
 
+#[cfg(vfio)]
+use crate::api::vfio::validate_configuration;
 #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
 use crate::api::{AttachContext, AttachDevice, RtcDevice};
 use crate::vmm::device_manager::irq::IrqAllocator;
 #[cfg(target_arch = "x86_64")]
 use crate::vmm::device_manager::legacy::PortIODeviceManager;
 use crate::vmm::device_manager::mmio::MMIODeviceManager;
+#[cfg(vfio)]
+use crate::vmm::device_manager::pci;
 use crate::vmm::resources::VmResources;
 #[cfg(not(target_os = "windows"))]
 use crate::vmm::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
@@ -787,6 +791,14 @@ pub fn build_microvm(
     };
 
     let requirements = device_manager.requirements();
+    #[cfg(vfio)]
+    validate_configuration(
+        &requirements,
+        pci_enabled,
+        vm_resources.acpi_enabled,
+        vm_resources.split_irqchip,
+    )
+    .map_err(|e| StartMicrovmError::AttachDevice(e.to_string()))?;
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     let legacy_rtc = !requirements.iter().any(|r| r.replaces_legacy_rtc);
     #[cfg(all(
@@ -1150,10 +1162,19 @@ pub fn build_microvm(
         any(target_os = "linux", target_os = "windows")
     ))]
     let pci_device_manager = if pci_enabled {
+        #[cfg(vfio)]
+        let high_window = requirements
+            .iter()
+            .any(|r| r.vfio_functions != 0)
+            .then(|| pci::high_window(vm.guest_phys_bits(), arch_memory_info.guest_last_addr))
+            .transpose()
+            .map_err(StartMicrovmError::RegisterPciDevice)?;
+        #[cfg(all(target_os = "linux", not(vfio)))]
+        let high_window = None;
         Some(device_manager::pci::PciHostManager::new(
             irq_allocator.clone(),
             #[cfg(target_os = "linux")]
-            None,
+            high_window,
         ))
     } else {
         None

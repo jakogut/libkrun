@@ -2,7 +2,11 @@ pub mod device_builders;
 pub mod error;
 pub mod logging;
 pub mod payload;
+#[cfg(vfio)]
+pub(crate) mod vfio;
 pub mod vmm_builder;
+#[cfg(vfio)]
+pub use vfio::VfioDevice;
 
 #[cfg(feature = "ffi")]
 pub(crate) use ffier::export_bitflags;

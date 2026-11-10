@@ -23,6 +23,8 @@ use kvm_ioctls::VmFd;
 use vm_memory::GuestMemoryMmap;
 
 use crate::vmm::device_manager::irq::IrqAllocator;
+#[cfg(vfio)]
+use arch::x86_64::layout::FIRST_ADDR_PAST_32BITS;
 
 const PCI_BUS0: u8 = 0;
 
@@ -48,6 +50,33 @@ impl Display for Error {
 }
 
 type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(vfio)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PciBarKind {
+    Io,
+    Memory32,
+    Memory64,
+}
+
+#[cfg(vfio)]
+pub(crate) fn high_window(guest_phys_bits: u32, guest_last_addr: u64) -> Result<Range<u64>> {
+    let end = 1u64 << guest_phys_bits;
+    guest_last_addr
+        .checked_add(1)
+        .and_then(|ram_end| {
+            ram_end
+                .max(FIRST_ADDR_PAST_32BITS)
+                .checked_next_multiple_of(1 << 30)
+        })
+        .filter(|start| *start < end)
+        .map(|start| start..end)
+        .ok_or_else(|| {
+            Error::Resource(io::Error::other(
+                "no guest address space for a 64-bit PCI window",
+            ))
+        })
+}
 
 /// Owns the bus-0 PCI functions and their guest address windows.
 pub struct PciHostManager {
@@ -148,6 +177,27 @@ impl PciHostManager {
         let address = PciAddress::new(PCI_BUS0, self.next_device, 0);
         self.next_device += 1;
         Ok((address, irq))
+    }
+
+    /// Allocates every requested BAR, or none of them.
+    #[cfg(vfio)]
+    pub(crate) fn allocate_bars(&mut self, bars: &[(PciBarKind, u64)]) -> Result<Vec<u64>> {
+        let (mut staged_io, mut staged_mmio32, mut staged_mmio64) =
+            (self.io.clone(), self.mmio32.clone(), self.mmio64.clone());
+        let addresses = bars
+            .iter()
+            .map(|&(kind, size)| {
+                match kind {
+                    PciBarKind::Io => &mut staged_io,
+                    PciBarKind::Memory32 => &mut staged_mmio32,
+                    PciBarKind::Memory64 => &mut staged_mmio64,
+                }
+                .allocate(size)
+            })
+            .collect::<io::Result<_>>()
+            .map_err(Error::Resource)?;
+        (self.io, self.mmio32, self.mmio64) = (staged_io, staged_mmio32, staged_mmio64);
+        Ok(addresses)
     }
 
     /// `address` and `irq` come from [`Self::allocate_function`].
@@ -298,6 +348,34 @@ mod tests {
         assert_eq!(info.bar_start, PCI_BAR_START);
         let info = PciHostManager::new(irqs, Some(1 << 36..1 << 37)).acpi_info();
         assert_eq!(info.high_window, Some(1 << 36..1 << 37));
+    }
+
+    #[cfg(vfio)]
+    #[test]
+    fn test_high_window_starts_above_ram_on_a_gib_boundary() {
+        assert_eq!(high_window(36, 0x7fff_ffff).unwrap(), 1 << 32..1 << 36);
+        assert_eq!(
+            high_window(40, (6 << 30) + 0xfff).unwrap(),
+            7 << 30..1 << 40
+        );
+        assert!(high_window(32, 0x7fff_ffff).is_err());
+    }
+
+    #[cfg(vfio)]
+    #[test]
+    fn test_pci_bar_allocation_is_all_or_nothing() {
+        let irqs = IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX);
+        let mut pci = PciHostManager::new(irqs, None);
+        let request = [
+            (PciBarKind::Memory32, 0x1000),
+            (PciBarKind::Memory64, 0x1000),
+        ];
+        assert!(pci.allocate_bars(&request).is_err());
+        let request = [(PciBarKind::Memory32, 0x1000), (PciBarKind::Io, 0x100)];
+        assert_eq!(
+            pci.allocate_bars(&request).unwrap(),
+            [PCI_BAR_START, PCI_IO_START]
+        );
     }
 
     #[test]

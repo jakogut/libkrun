@@ -5,6 +5,16 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=Hypervisor");
     }
 
+    println!("cargo:rustc-check-cfg=cfg(vfio)");
+    if env::var("CARGO_FEATURE_VFIO").is_ok()
+        && env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
+        && env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64")
+        && env::var("CARGO_FEATURE_TEE").is_err()
+        && env::var("CARGO_FEATURE_AWS_NITRO").is_err()
+    {
+        println!("cargo:rustc-cfg=vfio");
+    }
+
     let major = env::var("CARGO_PKG_VERSION_MAJOR").unwrap();
 
     let variant = if env::var("CARGO_FEATURE_AWS_NITRO").is_ok() {

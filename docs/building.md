@@ -22,6 +22,7 @@ All builds go through the top-level `Makefile`, which handles feature flag confi
 - `GPU=1`: Enables virtio-gpu support (`GpuDevice`). Requires virglrenderer development libraries.
 - `INPUT=1`: Enables virtio-input support (`InputDevice`).
 - `VHOST_USER=1`: Enables vhost-user device bridge support (`VhostUserDevice`).
+- `VFIO=1`: Enables [VFIO PCI assignment](vfio.md) on Linux/x86_64.
 - `TIMESYNC=1`: Enables PTP time synchronization device support.
 
 ### Compiling

@@ -62,6 +62,9 @@ endif
 ifeq ($(INPUT),1)
     FEATURE_FLAGS += --features input
 endif
+ifeq ($(VFIO),1)
+    FEATURE_FLAGS += --features vfio
+endif
 ifeq ($(VHOST_USER),1)
     FEATURE_FLAGS += --features vhost-user
 endif

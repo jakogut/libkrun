@@ -40,3 +40,7 @@ When TSI is enabled on `VsockDevice`:
 ## Getting in contact
 
 If you think you've identified a security issue in the project, please DO NOT report the issue publicly via the GitHub issue tracker or Matrix. Instead, send an email with as many details as possible to `libkrun-security@redhat.com`. This is a private mailing list for the core maintainers.
+
+## VFIO PCI assignment
+
+[VFIO](vfio.md) grants a guest control of a physical PCI function. The host IOMMU must isolate its DMA. Group viability alone does not make the device or guest trustworthy. Use exclusive access to the whole group and account for device firmware, reset behavior, and other functions sharing hardware. libkrun pins guest RAM for DMA and excludes mutable SHM/DAX windows.

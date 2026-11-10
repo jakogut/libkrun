@@ -48,6 +48,15 @@ use vm_memory::{Address, GuestMemoryBackend};
 
 use super::error::VmmError;
 use super::export_bitflags;
+#[cfg(vfio)]
+use {
+    crate::vmm::device_manager::pci::{PciBarKind, PciHostManager},
+    devices::pci::{PciAddress, PciFunction},
+    kvm_ioctls::VmFd,
+    std::io,
+    utils::eventfd::EventFd,
+    vm_memory::GuestAddress,
+};
 
 /// Requirements a device declares before the VM's memory and legacy devices are configured.
 /// `#[non_exhaustive]` allows adding new fields in minor releases.
@@ -64,6 +73,8 @@ pub struct DeviceRequirements {
     pub process_shareable_memory: bool,
     /// Supplies the guest RTC, suppressing any legacy or implicit RTC.
     pub replaces_legacy_rtc: bool,
+    /// Number of assigned host PCI functions.
+    pub vfio_functions: usize,
     /// Whether this device can discard or replace guest RAM pages.
     pub reclaims_guest_ram: bool,
     /// Whether this device replaces ranges of guest RAM with fresh memory to give it back to
@@ -272,6 +283,56 @@ impl<'a> AttachContext<'a> {
             .kernel_cmdline
             .insert_str(s)
             .unwrap_or_else(|e| log::error!("failed to append '{s}' to cmdline: {e}"));
+    }
+}
+
+#[cfg(vfio)]
+impl AttachContext<'_> {
+    pub(crate) fn vm_fd(&self) -> Arc<VmFd> {
+        self.vmm.vm.fd_shared()
+    }
+
+    pub(crate) fn exit_evt(&self) -> io::Result<EventFd> {
+        self.vmm.exit_evt.try_clone()
+    }
+
+    pub(crate) fn shm_regions(&self) -> Vec<(GuestAddress, usize)> {
+        self.shm_manager.regions()
+    }
+
+    pub(crate) fn allocate_pci_function(&mut self) -> Result<(PciAddress, u32), VmmError> {
+        self.pci_host()
+            .allocate_function()
+            .map_err(|e| VmmError::Internal(e.to_string()))
+    }
+
+    /// Allocates guest addresses for every requested BAR, or for none.
+    pub(crate) fn allocate_pci_bars(
+        &mut self,
+        bars: &[(PciBarKind, u64)],
+    ) -> Result<Vec<u64>, VmmError> {
+        self.pci_host()
+            .allocate_bars(bars)
+            .map_err(|e| VmmError::Internal(e.to_string()))
+    }
+
+    pub(crate) fn register_pci_function(
+        &mut self,
+        address: PciAddress,
+        irq: u32,
+        function: Arc<Mutex<dyn PciFunction>>,
+    ) -> Result<(), VmmError> {
+        self.pci_host()
+            .register_function(address, irq, function)
+            .map(|_| ())
+            .map_err(|e| VmmError::Internal(e.to_string()))
+    }
+
+    fn pci_host(&mut self) -> &mut PciHostManager {
+        self.vmm
+            .pci_device_manager
+            .as_mut()
+            .expect("PCI functions attach through a PciDeviceManager")
     }
 }
 
