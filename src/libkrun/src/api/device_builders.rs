@@ -64,6 +64,8 @@ pub struct DeviceRequirements {
     pub process_shareable_memory: bool,
     /// Supplies the guest RTC, suppressing any legacy or implicit RTC.
     pub replaces_legacy_rtc: bool,
+    /// Whether this device can discard or replace guest RAM pages.
+    pub reclaims_guest_ram: bool,
     /// Whether this device replaces ranges of guest RAM with fresh memory to give it back to
     /// the host. On macOS, that only frees the memory if RAM is mapped in blocks, which the
     /// VMM then does.
@@ -1378,6 +1380,7 @@ impl<'a> AttachDevice<'a> for BalloonDevice {
     #[cfg_attr(feature = "ffi", ffier(skip))]
     fn requirements(&self) -> DeviceRequirements {
         DeviceRequirements {
+            reclaims_guest_ram: true,
             #[cfg(target_os = "macos")]
             replaces_guest_ram: self.inner.lock().unwrap().free_page_reporting_mode()
                 == FreePageReportingMode::Replace,
