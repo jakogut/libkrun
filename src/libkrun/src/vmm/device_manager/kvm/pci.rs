@@ -126,35 +126,48 @@ impl PciHostManager {
         guest_memory: GuestMemoryMmap,
         device: Arc<Mutex<dyn VirtioDevice>>,
     ) -> Result<arch::x86_64::PciFunctionInfo> {
-        if self.next_device > 31 {
-            return Err(Error::IrqsExhausted);
-        }
-
-        let address = PciAddress::new(PCI_BUS0, self.next_device, 0);
         let bar_base = self
             .mmio32
             .allocate(VIRTIO_PCI_BAR0_SIZE)
             .map_err(Error::Resource)?;
-        let irq = self.irqs.alloc().map_err(|_| Error::IrqsExhausted)?;
+        let (address, irq) = self.allocate_function()?;
         let intx_line = Arc::new(KvmPciIntxLine { vm, gsi: irq });
         let transport =
             VirtioPciTransport::new(guest_memory, device, irq as u8, intx_line, bar_base as u32)
                 .map_err(Error::CreateTransport)?;
 
         let function: Arc<Mutex<dyn PciFunction>> = Arc::new(Mutex::new(transport));
+        self.register_function(address, irq, function)
+    }
+
+    pub(crate) fn allocate_function(&mut self) -> Result<(PciAddress, u32)> {
+        if self.next_device > 31 {
+            return Err(Error::IrqsExhausted);
+        }
+        let irq = self.irqs.alloc().map_err(|_| Error::IrqsExhausted)?;
+        let address = PciAddress::new(PCI_BUS0, self.next_device, 0);
+        self.next_device += 1;
+        Ok((address, irq))
+    }
+
+    /// `address` and `irq` come from [`Self::allocate_function`].
+    pub(crate) fn register_function(
+        &mut self,
+        address: PciAddress,
+        irq: u32,
+        function: Arc<Mutex<dyn PciFunction>>,
+    ) -> Result<arch::x86_64::PciFunctionInfo> {
         self.root
             .lock()
             .expect("Poisoned PCI root lock")
             .insert(address, function)
             .map_err(Error::PciRoot)?;
-
         let info = arch::x86_64::PciFunctionInfo {
             device: address.device,
             function: address.function,
             gsi: irq,
         };
         self.functions.push(info);
-        self.next_device += 1;
         Ok(info)
     }
 
