@@ -8,6 +8,7 @@
 #include <string.h>
 
 typedef void* KrunVmmError;
+typedef void* KrunVfioDevice;
 typedef void* KrunMmioDeviceManager;
 typedef void* KrunPciDeviceManager;
 typedef void* KrunFsDevice;
@@ -30,7 +31,7 @@ typedef void* KrunVhostUserDevice;
 typedef void* KrunDisplayBackend;
 typedef void* KrunGpuDevice;
 typedef void* KrunInputDevice;
-typedef void* KrunAttachDevice; /* KrunRtcDevice | KrunFsDevice | KrunConsoleDevice | KrunBlockDevice | KrunNetDevice | KrunGpuDevice | KrunInputDevice | KrunVhostUserDevice | KrunBalloonDevice | KrunRngDevice | KrunVsockDevice */
+typedef void* KrunAttachDevice; /* KrunVfioDevice | KrunRtcDevice | KrunFsDevice | KrunConsoleDevice | KrunBlockDevice | KrunNetDevice | KrunGpuDevice | KrunInputDevice | KrunVhostUserDevice | KrunBalloonDevice | KrunRngDevice | KrunVsockDevice */
 typedef void* KrunDeviceManager; /* KrunMmioDeviceManager | KrunPciDeviceManager */
 typedef void* KrunError; /* KrunVmmError | KrunVtableError */
 typedef void* KrunPushStr; /* KrunVtablePushStr */
@@ -38,7 +39,7 @@ typedef void* KrunPushStr; /* KrunVtablePushStr */
 #ifndef KRUN_PRIMITIVES_DEFINED
 #define KRUN_PRIMITIVES_DEFINED
 
-typedef void* KrunObject; /* KrunVmmError | KrunMmioDeviceManager | KrunPciDeviceManager | KrunFsDevice | KrunConsoleDevice | KrunConsoleBuilder | KrunFsOverlay | KrunPayload | KrunNitroConfig | KrunVmmBuilder | KrunVmm | KrunVmmHandle | KrunBalloonDevice | KrunRngDevice | KrunRtcDevice | KrunVsockDevice | KrunBlockDevice | KrunNetDevice | KrunDisplayInfoBuilder | KrunVhostUserDevice | KrunDisplayBackend | KrunGpuDevice | KrunInputDevice */
+typedef void* KrunObject; /* KrunVmmError | KrunVfioDevice | KrunMmioDeviceManager | KrunPciDeviceManager | KrunFsDevice | KrunConsoleDevice | KrunConsoleBuilder | KrunFsOverlay | KrunPayload | KrunNitroConfig | KrunVmmBuilder | KrunVmm | KrunVmmHandle | KrunBalloonDevice | KrunRngDevice | KrunRtcDevice | KrunVsockDevice | KrunBlockDevice | KrunNetDevice | KrunDisplayInfoBuilder | KrunVhostUserDevice | KrunDisplayBackend | KrunGpuDevice | KrunInputDevice */
 
 typedef uint64_t KrunResult;
 #define KRUN_RESULT_SUCCESS 0
@@ -205,6 +206,17 @@ typedef void (*krun_free_object_array_fn)(KrunObjectArray a);
 #define KRUN_ERROR_VMM_FEATURE_DISABLED ((uint64_t)16777217 << 32 | 7)
 #define KRUN_ERROR_VMM_BOOT_ERROR ((uint64_t)16777217 << 32 | 8)
 #define KRUN_ERROR_VMM_INTERNAL ((uint64_t)16777217 << 32 | 9)
+
+/* VfioDevice -------------------------------------------------------- */
+
+/**
+ * Validate a full `dddd:bb:dd.f` PCI address without opening the device.
+ * Hardware is opened only when the VM is built.
+ */
+KrunVfioDevice krun_vfio_device_new(KrunStr host_bdf, KrunError* err_out);
+typedef KrunVfioDevice (*krun_vfio_device_new_fn)(KrunStr host_bdf, KrunError* err_out);
+void krun_vfio_device_destroy(KrunVfioDevice handle);
+typedef void (*krun_vfio_device_destroy_fn)(KrunVfioDevice handle);
 
 /* MmioDeviceManager ------------------------------------------------- */
 

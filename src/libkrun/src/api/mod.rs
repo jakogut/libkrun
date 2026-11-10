@@ -2,7 +2,9 @@ pub mod device_builders;
 pub mod error;
 pub mod logging;
 pub mod payload;
-#[cfg(vfio)]
+// The ffier library definition expands this module's export metadata even
+// when VFIO is disabled, so ffi builds compile it with its items gated inside.
+#[cfg_attr(not(feature = "ffi"), cfg(vfio))]
 pub(crate) mod vfio;
 pub mod vmm_builder;
 #[cfg(vfio)]
@@ -78,6 +80,10 @@ pub use devices::virtio::port_io;
 #[cfg(feature = "ffi")]
 ffier::library_definition!("krun", library_tag = 1,
     primitives_prefix = "krun",
+    #[cfg(vfio)]
+    crate::api::vfio::VfioDevice = 28,
+    #[cfg(vfio)]
+    crate::api::device_builders::AttachDevice for crate::api::vfio::VfioDevice,
     crate::api::error::VmmError = 1,
     crate::api::device_builders::MmioDeviceManager<'_> = 2,
     #[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")))]

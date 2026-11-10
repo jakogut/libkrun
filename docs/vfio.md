@@ -16,6 +16,8 @@ let vmm = VmmBuilder::new()
 vmm.run();
 ```
 
+The C API uses `krun_vfio_device_new()` and `krun_pci_device_manager_add()`.
+
 ## Host setup
 
 libkrun does not bind drivers, change permissions, or reset the device. Before building the VM:

@@ -349,6 +349,14 @@
         }
       }
     },
+    "VfioDevice": {
+      "kind": {
+        "handle": {
+          "c_name": "KrunVfioDevice"
+        }
+      },
+      "type_tag": 16777244
+    },
     "VhostUserDevice": {
       "kind": {
         "handle": {
@@ -477,6 +485,39 @@
     }
   },
   "exported_types": [
+    {
+      "name": "VfioDevice",
+      "destroy_ffi_name": "krun_vfio_device_destroy",
+      "is_builder_type": false,
+      "methods": [
+        {
+          "name": "new",
+          "doc": [
+            " Validate a full `dddd:bb:dd.f` PCI address without opening the device.",
+            " Hardware is opened only when the VM is built."
+          ],
+          "receiver": "none",
+          "params": [
+            {
+              "name": "host_bdf",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "VfioDevice"
+            },
+            "err_type": "VmmError",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_vfio_device_new"
+        }
+      ],
+      "cfg": "all(feature = \"vfio\", target_os = \"linux\", target_arch = \"x86_64\",\nnot(any(feature = \"tee\", feature = \"aws-nitro\")))"
+    },
     {
       "name": "MmioDeviceManager",
       "destroy_ffi_name": "krun_mmio_device_manager_destroy",
@@ -3236,6 +3277,18 @@
     }
   ],
   "trait_impls": [
+    {
+      "trait_name": "AttachDevice",
+      "struct_name": "VfioDevice",
+      "lifetimes": [
+        "a"
+      ],
+      "trait_lifetime_args": [
+        "a"
+      ],
+      "methods": [],
+      "cfg": "all(feature = \"vfio\", target_os = \"linux\", target_arch = \"x86_64\",\nnot(any(feature = \"tee\", feature = \"aws-nitro\")))"
+    },
     {
       "trait_name": "DeviceManager",
       "struct_name": "MmioDeviceManager",

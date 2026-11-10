@@ -1,17 +1,27 @@
 // Copyright 2026 The libkrun Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{AttachContext, AttachDevice, DeviceRequirements, VmmError};
-use crate::vmm::vfio::VfioPci;
-use std::sync::{Arc, Mutex};
+#[cfg(vfio)]
+use {
+    super::{AttachContext, AttachDevice, DeviceRequirements, VmmError},
+    crate::vmm::vfio::VfioPci,
+    std::sync::{Arc, Mutex},
+};
 
 /// One host PCI function assigned through an IOMMU-protected VFIO group.
 ///
 /// Driver binding, permissions, and reset policy belong to the caller.
+#[cfg(vfio)]
 pub struct VfioDevice {
     host_bdf: String,
 }
 
+#[cfg_attr(
+    feature = "ffi",
+    ffier::export(
+        cfg = "all(feature = \"vfio\", target_os = \"linux\", target_arch = \"x86_64\", not(any(feature = \"tee\", feature = \"aws-nitro\")))"
+    )
+)]
 impl VfioDevice {
     /// Validate a full `dddd:bb:dd.f` PCI address without opening the device.
     /// Hardware is opened only when the VM is built.
@@ -36,7 +46,14 @@ impl VfioDevice {
     }
 }
 
+#[cfg_attr(
+    feature = "ffi",
+    ffier::export(
+        cfg = "all(feature = \"vfio\", target_os = \"linux\", target_arch = \"x86_64\", not(any(feature = \"tee\", feature = \"aws-nitro\")))"
+    )
+)]
 impl<'a> AttachDevice<'a> for VfioDevice {
+    #[cfg_attr(feature = "ffi", ffier(skip))]
     fn requirements(&self) -> DeviceRequirements {
         DeviceRequirements {
             vfio_functions: 1,
@@ -44,6 +61,7 @@ impl<'a> AttachDevice<'a> for VfioDevice {
         }
     }
 
+    #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
         let vfio = VfioPci::new(&self.host_bdf, ctx)
             .map_err(|e| VmmError::Internal(format!("VFIO: {e}")))?;
@@ -56,6 +74,7 @@ impl<'a> AttachDevice<'a> for VfioDevice {
     }
 }
 
+#[cfg(vfio)]
 pub(crate) fn validate_configuration(
     requirements: &[DeviceRequirements],
     pci: bool,
@@ -82,7 +101,7 @@ pub(crate) fn validate_configuration(
     Err(VmmError::MissingConfig(unsupported.into()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, vfio))]
 mod tests {
     use super::*;
     #[test]
