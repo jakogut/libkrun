@@ -51,6 +51,7 @@ use super::export_bitflags;
 #[cfg(vfio)]
 use {
     crate::vmm::device_manager::pci::{PciBarKind, PciHostManager},
+    crate::vmm::gsi_routing::GsiRouting,
     devices::pci::{PciAddress, PciFunction},
     kvm_ioctls::VmFd,
     std::io,
@@ -326,6 +327,11 @@ impl AttachContext<'_> {
             .register_function(address, irq, function)
             .map(|_| ())
             .map_err(|e| VmmError::Internal(e.to_string()))
+    }
+
+    /// The VM's GSI routing table, unless a userspace irqchip owns it.
+    pub(crate) fn gsi_routing(&self) -> Option<Arc<Mutex<GsiRouting>>> {
+        self.vmm.gsi_routing.clone()
     }
 
     fn pci_host(&mut self) -> &mut PciHostManager {

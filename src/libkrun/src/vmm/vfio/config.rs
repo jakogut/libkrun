@@ -161,7 +161,7 @@ mod tests {
         put16(&mut config, 0x82, 2);
         put32(&mut config, 0x84, PCI_EXP_DEVCAP_FLR);
         let mut access = ConfigAccess::new();
-        capabilities(&mut config, &mut access).unwrap();
+        capabilities(&mut config, &mut access, 0).unwrap();
         (config, access)
     }
 
@@ -214,7 +214,7 @@ mod tests {
         put32(&mut config, 0x84, PCI_EXP_DEVCAP_FLR);
         put16(&mut config, 0x88, PCI_EXP_DEVCTL_BCR_FLR);
         let mut access = ConfigAccess::new();
-        capabilities(&mut config, &mut access).unwrap();
+        capabilities(&mut config, &mut access, 0).unwrap();
         assert_eq!(config[PCI_CAPABILITY_LIST], 0x80);
         assert!(access.forwarded[0x40..0x68].iter().all(|byte| *byte == 0));
         assert!(

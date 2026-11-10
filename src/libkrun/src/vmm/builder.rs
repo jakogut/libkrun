@@ -41,6 +41,8 @@ use crate::vmm::device_manager::legacy::PortIODeviceManager;
 use crate::vmm::device_manager::mmio::MMIODeviceManager;
 #[cfg(vfio)]
 use crate::vmm::device_manager::pci;
+#[cfg(vfio)]
+use crate::vmm::gsi_routing::GsiRouting;
 use crate::vmm::resources::VmResources;
 #[cfg(not(target_os = "windows"))]
 use crate::vmm::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
@@ -1410,6 +1412,9 @@ pub fn build_microvm(
         reset_exit_code: vm_resources.reset_exit_code,
         exit_observers: Vec::new(),
         exit_code: exit_code.clone(),
+        #[cfg(vfio)]
+        gsi_routing: (!vm_resources.split_irqchip)
+            .then(|| Arc::new(Mutex::new(GsiRouting::new(vm.fd_shared())))),
         #[cfg(not(target_os = "windows"))]
         vm,
         mmio_device_manager,

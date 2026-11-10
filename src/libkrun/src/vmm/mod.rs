@@ -25,6 +25,8 @@ pub mod vmm_config;
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(vfio)]
+pub(crate) use crate::vmm::linux::gsi_routing;
 #[cfg(target_os = "linux")]
 use crate::vmm::linux::vstate;
 #[cfg(target_os = "macos")]
@@ -176,6 +178,9 @@ pub struct Vmm {
         any(target_os = "linux", target_os = "windows")
     ))]
     pub(crate) pci_device_manager: Option<PciHostManager>,
+    /// `None` with the split irqchip.
+    #[cfg(vfio)]
+    pub(crate) gsi_routing: Option<Arc<Mutex<gsi_routing::GsiRouting>>>,
 
     // Out-of-band live pause/resume requests: the C API sends `VmCtl` from
     // another thread; the event loop freezes or wakes the vCPUs. A single

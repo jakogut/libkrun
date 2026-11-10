@@ -5,6 +5,7 @@ use crate::api::AttachContext;
 mod config;
 mod pci_regs;
 use crate::vmm::device_manager::pci::PciBarKind;
+use crate::vmm::gsi_routing::GsiRouting;
 use config::{ConfigAccess, write_bars};
 use devices::pci::{
     PCI_CONVENTIONAL_CONFIG_SPACE_SIZE, PCI_EXTENDED_CONFIG_SPACE_SIZE, PciAddress, PciBarAccess,
@@ -19,7 +20,7 @@ use std::ops::Range;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicI32, Ordering},
 };
 use std::{array, mem};
@@ -81,6 +82,41 @@ fn bar_address_mask(register: u32) -> u32 {
         PCI_BASE_ADDRESS_IO_MASK
     } else {
         PCI_BASE_ADDRESS_MEM_MASK
+    }
+}
+
+/// Register offsets of an MSI capability, which shift with its 64-bit address
+/// and per-vector masking control bits.
+struct MsiLayout {
+    wide: bool,
+    maskable: bool,
+    data: usize,
+    mask: usize,
+    pending: usize,
+    end: usize,
+}
+impl MsiLayout {
+    fn new(control: u16, cap: usize) -> Self {
+        let wide = control & PCI_MSI_FLAGS_64BIT != 0;
+        let maskable = control & PCI_MSI_FLAGS_MASKBIT != 0;
+        let (data, mask, pending) = if wide {
+            (PCI_MSI_DATA_64, PCI_MSI_MASK_64, PCI_MSI_PENDING_64)
+        } else {
+            (PCI_MSI_DATA_32, PCI_MSI_MASK_32, PCI_MSI_PENDING_32)
+        };
+        let end = if maskable {
+            pending + size_of::<u32>()
+        } else {
+            data + size_of::<u16>()
+        };
+        Self {
+            wide,
+            maskable,
+            data: cap + data,
+            mask: cap + mask,
+            pending: cap + pending,
+            end: cap + end,
+        }
     }
 }
 
@@ -243,10 +279,25 @@ fn dma_regions(
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Message {
+    address: u64,
+    data: u32,
+    masked: bool,
+}
+struct Interrupt {
+    event: EventFd,
+    gsi: u32,
+    registered: bool,
+}
+
 /// Validates the capability list and relinks it to expose only the
-/// capabilities the guest may drive, which are power management and PCI
-/// Express.
-fn capabilities(config: &mut [u8; CONFIG_SIZE], access: &mut ConfigAccess) -> io::Result<()> {
+/// capabilities the guest may drive: power management, PCI Express and MSI.
+fn capabilities(
+    config: &mut [u8; CONFIG_SIZE],
+    access: &mut ConfigAccess,
+    msi_count: u32,
+) -> io::Result<Option<usize>> {
     let mut next = if get16(config, PCI_STATUS) & PCI_STATUS_CAP_LIST != 0 {
         config[PCI_CAPABILITY_LIST] as usize
     } else {
@@ -256,6 +307,7 @@ fn capabilities(config: &mut [u8; CONFIG_SIZE], access: &mut ConfigAccess) -> io
     let mut occupied = [false; PCI_CONVENTIONAL_CONFIG_SPACE_SIZE];
     let mut link = PCI_CAPABILITY_LIST;
     let mut hidden = Vec::new();
+    let mut msi = None;
     while next != 0 {
         if !(PCI_STD_HEADER_SIZEOF..PCI_CONVENTIONAL_CONFIG_SPACE_SIZE).contains(&next)
             || !next.is_multiple_of(size_of::<u32>())
@@ -284,15 +336,7 @@ fn capabilities(config: &mut [u8; CONFIG_SIZE], access: &mut ConfigAccess) -> io
                     ));
                 }
             },
-            PCI_CAP_ID_MSI => match (
-                control & PCI_MSI_FLAGS_64BIT != 0,
-                control & PCI_MSI_FLAGS_MASKBIT != 0,
-            ) {
-                (false, false) => 10,
-                (true, false) => 14,
-                (false, true) => 20,
-                (true, true) => 24,
-            },
+            PCI_CAP_ID_MSI => MsiLayout::new(control, 0).end.next_multiple_of(4),
             PCI_CAP_ID_MSIX => 12,
             PCI_CAP_ID_VPD => 8,
             PCI_CAP_ID_AF => 6,
@@ -312,7 +356,7 @@ fn capabilities(config: &mut [u8; CONFIG_SIZE], access: &mut ConfigAccess) -> io
         }
         occupied[cap..cap + size].fill(true);
         access.forwarded[cap..cap + size].fill(0);
-        if !matches!(id, PCI_CAP_ID_PM | PCI_CAP_ID_EXP) {
+        if !matches!(id, PCI_CAP_ID_PM | PCI_CAP_ID_EXP | PCI_CAP_ID_MSI) {
             hidden.push((cap, size));
             continue;
         }
@@ -351,6 +395,30 @@ fn capabilities(config: &mut [u8; CONFIG_SIZE], access: &mut ConfigAccess) -> io
             if control & PCI_EXP_FLAGS_VERS == 2 {
                 access.forwarded[cap + PCI_EXP_DEVCTL2..cap + PCI_EXP_DEVSTA2 + 2].fill(0xff);
             }
+        } else if id == PCI_CAP_ID_MSI {
+            if msi.is_some() || msi_count == 0 {
+                return Err(io::Error::other("invalid MSI capability"));
+            }
+            msi = Some(cap);
+            let layout = MsiLayout::new(control, cap);
+            access.protect(cap..cap + size);
+            put16(
+                config,
+                cap + PCI_MSI_FLAGS,
+                control & !(PCI_MSI_FLAGS_ENABLE | PCI_MSI_FLAGS_QMASK | PCI_MSI_FLAGS_QSIZE),
+            );
+            put16(
+                &mut access.writable,
+                cap + PCI_MSI_FLAGS,
+                PCI_MSI_FLAGS_ENABLE,
+            );
+            access.writable[cap + PCI_MSI_ADDRESS_LO..layout.data].fill(0xff);
+            access.writable[cap + PCI_MSI_ADDRESS_LO] &= !3;
+            put16(&mut access.writable, layout.data, u16::MAX);
+            config[layout.data + 2..cap + size].fill(0);
+            if layout.maskable {
+                put32(&mut access.writable, layout.mask, 1);
+            }
         }
     }
     for (cap, size) in hidden {
@@ -371,7 +439,62 @@ fn capabilities(config: &mut [u8; CONFIG_SIZE], access: &mut ConfigAccess) -> io
         let status = get16(config, PCI_STATUS) & !PCI_STATUS_CAP_LIST;
         put16(config, PCI_STATUS, status);
     }
-    Ok(())
+    Ok(msi)
+}
+
+/// The interrupt mode the guest enabled and, for MSI, its vector's message.
+fn irq_messages(config: &[u8], msi: Option<usize>) -> (Option<u32>, Vec<Message>) {
+    if let Some(cap) = msi.filter(|&c| get16(config, c + PCI_MSI_FLAGS) & PCI_MSI_FLAGS_ENABLE != 0)
+    {
+        let layout = MsiLayout::new(get16(config, cap + PCI_MSI_FLAGS), cap);
+        let address = u64::from(get32(config, cap + PCI_MSI_ADDRESS_LO))
+            | if layout.wide {
+                u64::from(get32(config, cap + PCI_MSI_ADDRESS_HI)) << 32
+            } else {
+                0
+            };
+        let data = u32::from(get16(config, layout.data));
+        let masked = layout.maskable && get32(config, layout.mask) & 1 != 0;
+        return (
+            Some(VFIO_PCI_MSI_IRQ_INDEX),
+            vec![Message {
+                address,
+                data,
+                masked,
+            }],
+        );
+    }
+    (
+        if get16(config, PCI_COMMAND) & PCI_COMMAND_INTX_DISABLE == 0 {
+            Some(VFIO_PCI_INTX_IRQ_INDEX)
+        } else {
+            None
+        },
+        Vec::new(),
+    )
+}
+
+fn event_pending(event: &EventFd) -> io::Result<bool> {
+    let mut fd = libc::pollfd {
+        fd: event.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    if unsafe { libc::poll(&mut fd, 1, 0) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd.revents & libc::POLLIN != 0)
+}
+
+/// Clears an event that was pending when its irqfd was registered. KVM injects
+/// such an event but leaves it counted, so it would still read as pending and
+/// be injected again the next time the vector is unmasked. Events signalled
+/// while the irqfd is registered are consumed by KVM itself.
+fn consume_event(event: &EventFd) -> io::Result<()> {
+    match event.read() {
+        Err(e) if e.kind() != io::ErrorKind::WouldBlock => Err(e),
+        _ => Ok(()),
+    }
 }
 
 fn release_all<T>(
@@ -408,6 +531,10 @@ pub(crate) struct VfioPci {
     irq: u32,
     intx: Option<Intx>,
     mode: Option<u32>,
+    interrupts: Vec<Interrupt>,
+    msi: Option<usize>,
+    routing: Arc<Mutex<GsiRouting>>,
+    gsis: Range<u32>,
     failed: bool,
 }
 impl VfioPci {
@@ -461,6 +588,9 @@ impl VfioPci {
     }
     pub(crate) fn new(host_bdf: &str, ctx: &mut AttachContext) -> io::Result<Self> {
         let (address, irq) = ctx.allocate_pci_function().map_err(io::Error::other)?;
+        let routing = ctx
+            .gsi_routing()
+            .expect("validate_configuration rejects the split irqchip");
         let vm = ctx.vm_fd();
         let mut create = kvm_create_device {
             type_: kvm_device_type_KVM_DEV_TYPE_VFIO,
@@ -489,6 +619,10 @@ impl VfioPci {
             exit_code: ctx.exit_code().clone(),
             intx: None,
             mode: None,
+            interrupts: Vec::new(),
+            msi: None,
+            routing,
+            gsis: 0..0,
             failed: false,
         };
         device.initialize(ctx)?;
@@ -533,7 +667,16 @@ impl VfioPci {
         for bar in &self.bars {
             write_bar_register(&mut self.config, bar);
         }
-        capabilities(&mut self.config, &mut self.access)?;
+        let msi_count = self
+            .device()
+            .get_irq_info(VFIO_PCI_MSI_IRQ_INDEX)
+            .map_or(0, |i| i.count);
+        self.msi = capabilities(&mut self.config, &mut self.access, msi_count)?;
+        self.gsis = self
+            .routing
+            .lock()
+            .unwrap()
+            .allocate(u32::from(self.msi.is_some()))?;
         let mut config = self.config;
         self.access.read_controls(&mut config, |start, data| {
             self.io_read(VFIO_PCI_CONFIG_REGION_INDEX, start as u64, data)
@@ -556,15 +699,17 @@ impl VfioPci {
                     .any(|b| a.io() == b.io() && overlaps(a.address, a.size, b.address, b.size))
             })
     }
-    /// The VFIO interrupt index the guest has enabled, if any.
-    fn interrupt_mode(&self) -> Option<u32> {
-        let intx = get16(&self.config, PCI_COMMAND) & PCI_COMMAND_INTX_DISABLE == 0
-            && self.config[PCI_INTERRUPT_PIN] != 0
+    fn irq_messages(&self) -> (Option<u32>, Vec<Message>) {
+        let (mode, messages) = irq_messages(&self.config, self.msi);
+        let intx = self.config[PCI_INTERRUPT_PIN] != 0
             && self
                 .device()
                 .get_irq_info(VFIO_PCI_INTX_IRQ_INDEX)
                 .is_some_and(|i| i.count != 0);
-        intx.then_some(VFIO_PCI_INTX_IRQ_INDEX)
+        (
+            mode.filter(|mode| *mode != VFIO_PCI_INTX_IRQ_INDEX || intx),
+            messages,
+        )
     }
     fn clear_interrupts(&mut self) -> io::Result<()> {
         let mut first = None;
@@ -573,6 +718,14 @@ impl VfioPci {
                 Ok(()) => self.mode = None,
                 Err(e) => first = Some(io::Error::other(e)),
             }
+        }
+        if let Err(e) = release_all(&mut self.interrupts, |irq| {
+            if irq.registered {
+                self.vm.unregister_irqfd(&irq.event, irq.gsi)?;
+            }
+            Ok(())
+        }) {
+            first.get_or_insert(e);
         }
         if let Some(intx) = &self.intx {
             let result = if intx.registered {
@@ -591,33 +744,74 @@ impl VfioPci {
     }
 
     fn update_interrupts(&mut self) -> io::Result<()> {
-        let mode = self.interrupt_mode();
+        let (mode, messages) = self.irq_messages();
         if self.mode != mode {
             self.clear_interrupts()?;
         }
-        if mode.is_some() && self.mode.is_none() {
-            let event = EventFd::new(libc::EFD_NONBLOCK | libc::EFD_CLOEXEC)?;
-            let resample = EventFd::new(libc::EFD_NONBLOCK | libc::EFD_CLOEXEC)?;
-            self.intx = Some(Intx {
-                event,
-                resample,
-                registered: false,
-            });
-            let intx = self.intx.as_ref().unwrap();
-            let device = &self.vfio.as_ref().unwrap().0;
-            device
-                .enable_irq(VFIO_PCI_INTX_IRQ_INDEX, vec![&intx.event])
-                .map_err(io::Error::other)?;
-            self.mode = Some(VFIO_PCI_INTX_IRQ_INDEX);
-            device
-                .set_irq_resample_fd(VFIO_PCI_INTX_IRQ_INDEX, vec![&intx.resample])
-                .map_err(io::Error::other)?;
-            self.vm
-                .register_irqfd_with_resample(&intx.event, &intx.resample, self.irq)?;
-            self.intx.as_mut().unwrap().registered = true;
-            self.device()
-                .unmask_irq(VFIO_PCI_INTX_IRQ_INDEX)
-                .map_err(io::Error::other)?;
+        // Keep eventfds across masking and message changes so that masked
+        // interrupts remain pending and KVM injects them when the irqfd is
+        // registered again.
+        for (irq, message) in self.interrupts.iter_mut().zip(&messages) {
+            if irq.registered && message.masked {
+                self.vm.unregister_irqfd(&irq.event, irq.gsi)?;
+                irq.registered = false;
+            }
+        }
+        let base = self.gsis.start;
+        self.routing
+            .lock()
+            .unwrap()
+            .update(self.gsis.clone().map(|gsi| {
+                let message = messages.get((gsi - base) as usize).filter(|m| !m.masked);
+                (gsi, message.map(|m| (m.address, m.data)))
+            }))?;
+        match mode {
+            Some(VFIO_PCI_INTX_IRQ_INDEX) if self.mode.is_none() => {
+                let event = EventFd::new(libc::EFD_NONBLOCK | libc::EFD_CLOEXEC)?;
+                let resample = EventFd::new(libc::EFD_NONBLOCK | libc::EFD_CLOEXEC)?;
+                self.intx = Some(Intx {
+                    event,
+                    resample,
+                    registered: false,
+                });
+                let intx = self.intx.as_ref().unwrap();
+                let device = &self.vfio.as_ref().unwrap().0;
+                device
+                    .enable_irq(VFIO_PCI_INTX_IRQ_INDEX, vec![&intx.event])
+                    .map_err(io::Error::other)?;
+                self.mode = Some(VFIO_PCI_INTX_IRQ_INDEX);
+                device
+                    .set_irq_resample_fd(VFIO_PCI_INTX_IRQ_INDEX, vec![&intx.resample])
+                    .map_err(io::Error::other)?;
+                self.vm
+                    .register_irqfd_with_resample(&intx.event, &intx.resample, self.irq)?;
+                self.intx.as_mut().unwrap().registered = true;
+                self.device()
+                    .unmask_irq(VFIO_PCI_INTX_IRQ_INDEX)
+                    .map_err(io::Error::other)?;
+            }
+            Some(index) if self.mode.is_none() => {
+                for i in 0..messages.len() {
+                    self.interrupts.push(Interrupt {
+                        event: EventFd::new(libc::EFD_NONBLOCK | libc::EFD_CLOEXEC)?,
+                        gsi: base + i as u32,
+                        registered: false,
+                    });
+                }
+                let device = &self.vfio.as_ref().unwrap().0;
+                device
+                    .enable_irq(index, self.interrupts.iter().map(|i| &i.event).collect())
+                    .map_err(io::Error::other)?;
+                self.mode = Some(index);
+            }
+            _ => (),
+        }
+        for (irq, message) in self.interrupts.iter_mut().zip(&messages) {
+            if !irq.registered && !message.masked {
+                self.vm.register_irqfd(&irq.event, irq.gsi)?;
+                irq.registered = true;
+                consume_event(&irq.event)?;
+            }
         }
         Ok(())
     }
@@ -716,6 +910,34 @@ impl PciFunction for VfioPci {
             data.fill(0xff);
             return;
         }
+        if let Some(pending) = self
+            .msi
+            .map(|cap| MsiLayout::new(get16(&self.config, cap + PCI_MSI_FLAGS), cap))
+            .filter(|msi| {
+                msi.maskable
+                    && overlaps(
+                        msi.pending as u64,
+                        size_of::<u32>() as u64,
+                        start as u64,
+                        data.len() as u64,
+                    )
+            })
+            .map(|msi| msi.pending)
+        {
+            let result = self
+                .interrupts
+                .first()
+                .filter(|_| self.mode == Some(VFIO_PCI_MSI_IRQ_INDEX))
+                .map_or(Ok(false), |irq| event_pending(&irq.event));
+            match result {
+                Ok(value) => put32(&mut self.config, pending, u32::from(value)),
+                Err(e) => {
+                    self.failure(Err(e));
+                    data.fill(0xff);
+                    return;
+                }
+            }
+        }
         let result = self
             .access
             .read(&self.config, start, data, |offset, bytes| {
@@ -795,33 +1017,12 @@ mod tests {
         put16(&mut config, PCI_STATUS, PCI_STATUS_CAP_LIST);
         config[PCI_CAPABILITY_LIST] = 0x40;
         config[0x40] = PCI_CAP_ID_PM;
-        assert!(capabilities(&mut config.clone(), &mut ConfigAccess::new()).is_ok());
+        assert!(capabilities(&mut config.clone(), &mut ConfigAccess::new(), 0).is_ok());
         for next in [0x40, 0x41, 0x20, 0x44] {
             config[0x41] = next;
             config[0x44] = PCI_CAP_ID_PM;
-            assert!(capabilities(&mut config.clone(), &mut ConfigAccess::new()).is_err());
+            assert!(capabilities(&mut config.clone(), &mut ConfigAccess::new(), 0).is_err());
         }
-    }
-    #[test]
-    fn vfio_capabilities_hide_msi_and_msix() {
-        let mut config = [0; CONFIG_SIZE];
-        put16(&mut config, PCI_STATUS, PCI_STATUS_CAP_LIST);
-        config[PCI_CAPABILITY_LIST] = 0x40;
-        config[0x40] = PCI_CAP_ID_PM;
-        config[0x41] = 0x50;
-        config[0x50] = PCI_CAP_ID_MSI;
-        config[0x51] = 0x60;
-        config[0x60] = PCI_CAP_ID_MSIX;
-        capabilities(&mut config, &mut ConfigAccess::new()).unwrap();
-        assert_eq!(config[PCI_CAPABILITY_LIST], 0x40);
-        assert_eq!(config[0x41], 0);
-        config[0x40] = PCI_CAP_ID_MSI;
-        config[0x41] = 0x50;
-        config[0x50] = PCI_CAP_ID_MSIX;
-        config[0x51] = 0;
-        capabilities(&mut config, &mut ConfigAccess::new()).unwrap();
-        assert_eq!(config[PCI_CAPABILITY_LIST], 0);
-        assert_eq!(get16(&config, 6) & 0x10, 0);
     }
     #[test]
     fn vfio_pcie_capability_bounds_follow_version_and_endpoint_type() {
@@ -833,9 +1034,9 @@ mod tests {
             config[0x41] = 0x40 + size;
             put16(&mut config, 0x42, flags);
             config[0x40 + size as usize] = PCI_CAP_ID_PM;
-            assert!(capabilities(&mut config.clone(), &mut ConfigAccess::new()).is_ok());
+            assert!(capabilities(&mut config.clone(), &mut ConfigAccess::new(), 0).is_ok());
             config[0x41] -= 4;
-            assert!(capabilities(&mut config, &mut ConfigAccess::new()).is_err());
+            assert!(capabilities(&mut config, &mut ConfigAccess::new(), 0).is_err());
         }
         for flags in [0, 3, 0x42, 0xf2] {
             let mut config = [0; CONFIG_SIZE];
@@ -843,7 +1044,7 @@ mod tests {
             config[PCI_CAPABILITY_LIST] = 0x40;
             config[0x40] = PCI_CAP_ID_EXP;
             put16(&mut config, 0x42, flags);
-            assert!(capabilities(&mut config, &mut ConfigAccess::new()).is_err());
+            assert!(capabilities(&mut config, &mut ConfigAccess::new(), 0).is_err());
         }
     }
     #[test]
@@ -901,5 +1102,100 @@ mod tests {
         .unwrap();
         release_all(&mut resources, |_| panic!("already released")).unwrap();
         assert_eq!(attempts, [1, 2, 3, 2]);
+    }
+
+    #[test]
+    fn vfio_msi_capability_requires_a_host_vector_and_offers_one() {
+        let mut config = [0; CONFIG_SIZE];
+        put16(&mut config, PCI_STATUS, PCI_STATUS_CAP_LIST);
+        config[PCI_CAPABILITY_LIST] = 0x40;
+        config[0x40] = PCI_CAP_ID_MSI;
+        put16(&mut config, 0x42, 0x18e);
+        assert!(capabilities(&mut config.clone(), &mut ConfigAccess::new(), 0).is_err());
+        let mut exposed = config;
+        assert_eq!(
+            capabilities(&mut exposed, &mut ConfigAccess::new(), 1).unwrap(),
+            Some(0x40)
+        );
+        assert_eq!(get16(&exposed, 0x42), 0x180);
+        config[0x41] = 0x54;
+        config[0x54] = PCI_CAP_ID_PM;
+        assert!(capabilities(&mut config, &mut ConfigAccess::new(), 1).is_err());
+    }
+    #[test]
+    fn vfio_msi_mask_selection_and_pending_event() {
+        let mut config = [0; CONFIG_SIZE];
+        put16(&mut config, 0x42, 0x181);
+        put32(&mut config, 0x44, 0xfee0_0000);
+        let (mode, messages) = irq_messages(&config, Some(0x40));
+        assert_eq!(mode, Some(VFIO_PCI_MSI_IRQ_INDEX));
+        assert!(!messages[0].masked);
+        put32(&mut config, 0x50, 1);
+        assert!(irq_messages(&config, Some(0x40)).1[0].masked);
+        put16(&mut config, 0x42, 0x180);
+        assert_eq!(
+            irq_messages(&config, Some(0x40)),
+            (Some(VFIO_PCI_INTX_IRQ_INDEX), vec![])
+        );
+        let event = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        event.write(1).unwrap();
+        assert!(event_pending(&event).unwrap());
+        assert!(event_pending(&event).unwrap());
+        assert_eq!(event.read().unwrap(), 1);
+        assert!(!event_pending(&event).unwrap());
+        event.write(1).unwrap();
+        consume_event(&event).unwrap();
+        assert!(!event_pending(&event).unwrap());
+        consume_event(&event).unwrap();
+    }
+    #[test]
+    fn vfio_msi_spanning_accesses_match_byte_word_and_dword_writes() {
+        for flags in [
+            0,
+            PCI_MSI_FLAGS_64BIT,
+            PCI_MSI_FLAGS_MASKBIT,
+            PCI_MSI_FLAGS_64BIT | PCI_MSI_FLAGS_MASKBIT,
+        ] {
+            let layout = MsiLayout::new(flags, 0x40);
+            for width in [1, 2, 4] {
+                let mut config = [0; CONFIG_SIZE];
+                put16(&mut config, PCI_STATUS, PCI_STATUS_CAP_LIST);
+                config[PCI_CAPABILITY_LIST] = 0x40;
+                config[0x40] = PCI_CAP_ID_MSI;
+                config[0x41] = 0x60;
+                config[0x60] = PCI_CAP_ID_PM;
+                put16(&mut config, 0x42, flags | PCI_MSI_FLAGS_QMASK);
+                let mut access = ConfigAccess::new();
+                capabilities(&mut config, &mut access, 1).unwrap();
+                let old = config;
+                for (offset, bytes) in [(0x40, [0xff; 4]), (layout.data, [0x34, 0x12, 0xff, 0xff])]
+                {
+                    for (i, data) in bytes.chunks(width).enumerate() {
+                        let start = offset + i * width;
+                        access
+                            .write(start, data, |_, _| panic!("MSI must stay emulated"))
+                            .unwrap();
+                        access.emulate(&mut config, start, data);
+                    }
+                }
+                assert_eq!(&config[0x40..0x42], &old[0x40..0x42]);
+                assert_eq!(get16(&config, 0x42), flags | PCI_MSI_FLAGS_ENABLE);
+                assert_eq!(get16(&config, layout.data), 0x1234);
+                assert_eq!(&config[layout.data + 2..layout.data + 4], &[0, 0]);
+                if layout.maskable {
+                    access.emulate(&mut config, layout.mask, &[0xff; 8]);
+                    assert_eq!(get32(&config, layout.mask), 1);
+                    assert_eq!(get32(&config, layout.pending), 0);
+                }
+                assert_eq!(&config[0x60..0x68], &old[0x60..0x68]);
+                let mut data = vec![0; layout.end - 0x40];
+                access
+                    .read(&config, 0x40, &mut data, |_, _| {
+                        panic!("MSI must stay emulated")
+                    })
+                    .unwrap();
+                assert_eq!(data, config[0x40..layout.end]);
+            }
+        }
     }
 }

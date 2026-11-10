@@ -43,3 +43,7 @@ Hidden capabilities are non-writable. Known lengths bound their protected ranges
 BARs may move only within the span reserved for this function's BARs of the same kind. Overlapping or out-of-range BAR addresses disable BAR access. I/O and memory decode are independent, and both require the PM state read back from VFIO to be D0. Accessible BAR reads and writes trap to VFIO.
 
 The compatibility contract covers standard PCI configuration and interrupt access paths. Devices whose drivers require configuration or interrupt-table aliases through BARs are outside this scope. PCIe capability version zero and device-specific MSI-X pending-bit-array errata are not corrected. Malformed capability and region metadata remain errors. This is not a claim that every GPU, NIC, or host-created virtual function works. Device reset/recovery and surprise physical removal require separate qualification and handling.
+
+## Interrupts
+
+INTx uses the in-kernel IOAPIC. An exposed MSI capability offers one vector and requires a reported host MSI vector and a guest GSI route at attachment. MSI address, data, enable, and mask writes are emulated even when a byte, word, or dword access also touches a capability header or reserved bytes. Masked events stay pending and are delivered when unmasked. Host activation must succeed before the mode becomes active or guest irqfds are registered. A later access failure stops the VM with a nonzero exit status.
