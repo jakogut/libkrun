@@ -3,6 +3,8 @@
 
 use crate::api::AttachContext;
 mod config;
+mod irq;
+use irq::set_irq_eventfds;
 mod pci_regs;
 use crate::vmm::device_manager::pci::PciBarKind;
 use crate::vmm::gsi_routing::GsiRouting;
@@ -141,6 +143,17 @@ impl Bar {
         } else {
             PCI_COMMAND_MEMORY
         }
+    }
+    fn access(
+        &self,
+        address: u64,
+        length: usize,
+        config: &[u8],
+        access: &ConfigAccess,
+    ) -> Option<u64> {
+        (contains(self.address, self.size, address, length as u64)
+            && access.decoding(config, self.decode_enable()))
+        .then(|| address - self.address)
     }
     fn mask(&self) -> u64 {
         !(self.size - 1)
@@ -291,13 +304,86 @@ struct Interrupt {
     registered: bool,
 }
 
+struct Msix {
+    cap: usize,
+    bar: usize,
+    offset: u64,
+    table: Vec<u8>,
+    pba_bar: usize,
+    pba_offset: u64,
+}
+impl Msix {
+    fn vectors(&self) -> usize {
+        self.table.len() / PCI_MSIX_ENTRY_SIZE
+    }
+    fn pba_size(&self) -> u64 {
+        (self.vectors() as u64).div_ceil(u64::BITS.into()) * size_of::<u64>() as u64
+    }
+    fn overlaps_pba(&self, bar: usize, offset: u64, size: usize) -> bool {
+        self.pba_bar == bar && overlaps(self.pba_offset, self.pba_size(), offset, size as u64)
+    }
+    fn overlaps(&self, bar: usize, offset: u64, size: usize) -> bool {
+        self.bar == bar && overlaps(self.offset, self.table.len() as u64, offset, size as u64)
+    }
+    fn access(&self, bar: usize, offset: u64, size: usize) -> Option<MsixAccess> {
+        let index = |base: u64, length: u64| {
+            contains(base, length, offset, size as u64).then(|| (offset - base) as usize)
+        };
+        if self.overlaps_pba(bar, offset, size) {
+            Some(
+                index(self.pba_offset, self.pba_size())
+                    .map_or(MsixAccess::Straddling, MsixAccess::Pba),
+            )
+        } else if self.overlaps(bar, offset, size) {
+            Some(
+                index(self.offset, self.table.len() as u64)
+                    .map_or(MsixAccess::Straddling, MsixAccess::Table),
+            )
+        } else {
+            None
+        }
+    }
+    fn messages(&self, config: &[u8], vectors: Range<usize>) -> Vec<Message> {
+        let masked = get16(config, self.cap + PCI_MSIX_FLAGS) & PCI_MSIX_FLAGS_MASKALL != 0;
+        self.table.as_chunks::<PCI_MSIX_ENTRY_SIZE>().0[vectors]
+            .iter()
+            .map(|e| Message {
+                address: u64::from(get32(e, PCI_MSIX_ENTRY_LOWER_ADDR))
+                    | (u64::from(get32(e, PCI_MSIX_ENTRY_UPPER_ADDR)) << 32),
+                data: get32(e, PCI_MSIX_ENTRY_DATA),
+                masked: masked
+                    || get32(e, PCI_MSIX_ENTRY_VECTOR_CTRL) & PCI_MSIX_ENTRY_CTRL_MASKBIT != 0,
+            })
+            .collect()
+    }
+    fn write_table(&mut self, index: usize, data: &[u8]) -> Range<usize> {
+        self.table[index..index + data.len()].copy_from_slice(data);
+        let vectors =
+            index / PCI_MSIX_ENTRY_SIZE..(index + data.len()).div_ceil(PCI_MSIX_ENTRY_SIZE);
+        for entry in &mut self.table.as_chunks_mut::<PCI_MSIX_ENTRY_SIZE>().0[vectors.clone()] {
+            let control = get32(entry, PCI_MSIX_ENTRY_VECTOR_CTRL) & PCI_MSIX_ENTRY_CTRL_MASKBIT;
+            put32(entry, PCI_MSIX_ENTRY_VECTOR_CTRL, control);
+        }
+        vectors
+    }
+}
+/// A BAR access that touches the MSI-X table or pending-bit array, with its
+/// offset into the structure it lies within.
+enum MsixAccess {
+    Table(usize),
+    Pba(usize),
+    Straddling,
+}
+
 /// Validates the capability list and relinks it to expose only the
-/// capabilities the guest may drive: power management, PCI Express and MSI.
+/// capabilities the guest may drive: power management, PCI Express, MSI and MSI-X.
 fn capabilities(
     config: &mut [u8; CONFIG_SIZE],
     access: &mut ConfigAccess,
     msi_count: u32,
-) -> io::Result<Option<usize>> {
+    bars: &[Bar],
+    msix_count: u32,
+) -> io::Result<(Option<usize>, Option<Msix>)> {
     let mut next = if get16(config, PCI_STATUS) & PCI_STATUS_CAP_LIST != 0 {
         config[PCI_CAPABILITY_LIST] as usize
     } else {
@@ -308,6 +394,7 @@ fn capabilities(
     let mut link = PCI_CAPABILITY_LIST;
     let mut hidden = Vec::new();
     let mut msi = None;
+    let mut msix = None;
     while next != 0 {
         if !(PCI_STD_HEADER_SIZEOF..PCI_CONVENTIONAL_CONFIG_SPACE_SIZE).contains(&next)
             || !next.is_multiple_of(size_of::<u32>())
@@ -337,7 +424,7 @@ fn capabilities(
                 }
             },
             PCI_CAP_ID_MSI => MsiLayout::new(control, 0).end.next_multiple_of(4),
-            PCI_CAP_ID_MSIX => 12,
+            PCI_CAP_ID_MSIX => PCI_CAP_MSIX_SIZEOF,
             PCI_CAP_ID_VPD => 8,
             PCI_CAP_ID_AF => 6,
             PCI_CAP_ID_VNDR => {
@@ -356,7 +443,10 @@ fn capabilities(
         }
         occupied[cap..cap + size].fill(true);
         access.forwarded[cap..cap + size].fill(0);
-        if !matches!(id, PCI_CAP_ID_PM | PCI_CAP_ID_EXP | PCI_CAP_ID_MSI) {
+        if !matches!(
+            id,
+            PCI_CAP_ID_PM | PCI_CAP_ID_EXP | PCI_CAP_ID_MSI | PCI_CAP_ID_MSIX
+        ) {
             hidden.push((cap, size));
             continue;
         }
@@ -419,6 +509,51 @@ fn capabilities(
             if layout.maskable {
                 put32(&mut access.writable, layout.mask, 1);
             }
+        } else if id == PCI_CAP_ID_MSIX {
+            let count = (control & PCI_MSIX_FLAGS_QSIZE) as usize + 1;
+            if msix.is_some() || msix_count < count as u32 {
+                return Err(io::Error::other("invalid MSI-X capability"));
+            }
+            let location = get32(config, cap + PCI_MSIX_TABLE);
+            let pba = get32(config, cap + PCI_MSIX_PBA);
+            let mut table = vec![0u8; count * PCI_MSIX_ENTRY_SIZE];
+            for entry in table.as_chunks_mut::<PCI_MSIX_ENTRY_SIZE>().0 {
+                put32(
+                    entry,
+                    PCI_MSIX_ENTRY_VECTOR_CTRL,
+                    PCI_MSIX_ENTRY_CTRL_MASKBIT,
+                );
+            }
+            let table = Msix {
+                cap,
+                bar: (location & PCI_MSIX_TABLE_BIR) as usize,
+                offset: u64::from(location & PCI_MSIX_TABLE_OFFSET),
+                table,
+                pba_bar: (pba & PCI_MSIX_PBA_BIR) as usize,
+                pba_offset: u64::from(pba & PCI_MSIX_PBA_OFFSET),
+            };
+            let valid = |index, offset, size| {
+                bars.iter()
+                    .any(|b| b.index == index && !b.io() && contains(0, b.size, offset, size))
+            };
+            if !valid(table.bar, table.offset, table.table.len() as u64)
+                || !valid(table.pba_bar, table.pba_offset, table.pba_size())
+                || table.overlaps_pba(table.bar, table.offset, table.table.len())
+            {
+                return Err(io::Error::other("invalid MSI-X table or pending-bit array"));
+            }
+            msix = Some(table);
+            put16(
+                config,
+                cap + PCI_MSIX_FLAGS,
+                control & !(PCI_MSIX_FLAGS_ENABLE | PCI_MSIX_FLAGS_MASKALL),
+            );
+            access.protect(cap..cap + size);
+            put16(
+                &mut access.writable,
+                cap + PCI_MSIX_FLAGS,
+                PCI_MSIX_FLAGS_ENABLE | PCI_MSIX_FLAGS_MASKALL,
+            );
         }
     }
     for (cap, size) in hidden {
@@ -439,11 +574,24 @@ fn capabilities(
         let status = get16(config, PCI_STATUS) & !PCI_STATUS_CAP_LIST;
         put16(config, PCI_STATUS, status);
     }
-    Ok(msi)
+    Ok((msi, msix))
 }
 
-/// The interrupt mode the guest enabled and, for MSI, its vector's message.
-fn irq_messages(config: &[u8], msi: Option<usize>) -> (Option<u32>, Vec<Message>) {
+/// The interrupt mode the guest enabled and, for MSI or MSI-X, the messages
+/// of its vectors.
+fn irq_messages(
+    config: &[u8],
+    msi: Option<usize>,
+    msix: Option<&Msix>,
+) -> (Option<u32>, Vec<Message>) {
+    if let Some(table) =
+        msix.filter(|t| get16(config, t.cap + PCI_MSIX_FLAGS) & PCI_MSIX_FLAGS_ENABLE != 0)
+    {
+        return (
+            Some(VFIO_PCI_MSIX_IRQ_INDEX),
+            table.messages(config, 0..table.vectors()),
+        );
+    }
     if let Some(cap) = msi.filter(|&c| get16(config, c + PCI_MSI_FLAGS) & PCI_MSI_FLAGS_ENABLE != 0)
     {
         let layout = MsiLayout::new(get16(config, cap + PCI_MSI_FLAGS), cap);
@@ -497,6 +645,28 @@ fn consume_event(event: &EventFd) -> io::Result<()> {
     }
 }
 
+fn read_msix_pending(
+    mode: Option<u32>,
+    interrupts: &[Interrupt],
+    offset: usize,
+    data: &mut [u8],
+) -> io::Result<()> {
+    data.fill(0);
+    if mode == Some(VFIO_PCI_MSIX_IRQ_INDEX) {
+        for (byte, vectors) in data
+            .iter_mut()
+            .zip(interrupts.chunks(u8::BITS as usize).skip(offset))
+        {
+            for (bit, irq) in vectors.iter().enumerate() {
+                if event_pending(&irq.event)? {
+                    *byte |= 1 << bit;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn release_all<T>(
     values: &mut Vec<T>,
     mut release: impl FnMut(&mut T) -> io::Result<()>,
@@ -533,6 +703,7 @@ pub(crate) struct VfioPci {
     mode: Option<u32>,
     interrupts: Vec<Interrupt>,
     msi: Option<usize>,
+    msix: Option<Msix>,
     routing: Arc<Mutex<GsiRouting>>,
     gsis: Range<u32>,
     failed: bool,
@@ -621,6 +792,7 @@ impl VfioPci {
             mode: None,
             interrupts: Vec::new(),
             msi: None,
+            msix: None,
             routing,
             gsis: 0..0,
             failed: false,
@@ -671,12 +843,23 @@ impl VfioPci {
             .device()
             .get_irq_info(VFIO_PCI_MSI_IRQ_INDEX)
             .map_or(0, |i| i.count);
-        self.msi = capabilities(&mut self.config, &mut self.access, msi_count)?;
-        self.gsis = self
-            .routing
-            .lock()
-            .unwrap()
-            .allocate(u32::from(self.msi.is_some()))?;
+        let msix_count = self
+            .device()
+            .get_irq_info(VFIO_PCI_MSIX_IRQ_INDEX)
+            .map_or(0, |i| i.count);
+        (self.msi, self.msix) = capabilities(
+            &mut self.config,
+            &mut self.access,
+            msi_count,
+            &self.bars,
+            msix_count,
+        )?;
+        let vectors = self
+            .msix
+            .as_ref()
+            .map_or(0, |msix| msix.vectors() as u32)
+            .max(u32::from(self.msi.is_some()));
+        self.gsis = self.routing.lock().unwrap().allocate(vectors)?;
         let mut config = self.config;
         self.access.read_controls(&mut config, |start, data| {
             self.io_read(VFIO_PCI_CONFIG_REGION_INDEX, start as u64, data)
@@ -700,7 +883,7 @@ impl VfioPci {
             })
     }
     fn irq_messages(&self) -> (Option<u32>, Vec<Message>) {
-        let (mode, messages) = irq_messages(&self.config, self.msi);
+        let (mode, messages) = irq_messages(&self.config, self.msi, self.msix.as_ref());
         let intx = self.config[PCI_INTERRUPT_PIN] != 0
             && self
                 .device()
@@ -748,23 +931,6 @@ impl VfioPci {
         if self.mode != mode {
             self.clear_interrupts()?;
         }
-        // Keep eventfds across masking and message changes so that masked
-        // interrupts remain pending and KVM injects them when the irqfd is
-        // registered again.
-        for (irq, message) in self.interrupts.iter_mut().zip(&messages) {
-            if irq.registered && message.masked {
-                self.vm.unregister_irqfd(&irq.event, irq.gsi)?;
-                irq.registered = false;
-            }
-        }
-        let base = self.gsis.start;
-        self.routing
-            .lock()
-            .unwrap()
-            .update(self.gsis.clone().map(|gsi| {
-                let message = messages.get((gsi - base) as usize).filter(|m| !m.masked);
-                (gsi, message.map(|m| (m.address, m.data)))
-            }))?;
         match mode {
             Some(VFIO_PCI_INTX_IRQ_INDEX) if self.mode.is_none() => {
                 let event = EventFd::new(libc::EFD_NONBLOCK | libc::EFD_CLOEXEC)?;
@@ -776,9 +942,7 @@ impl VfioPci {
                 });
                 let intx = self.intx.as_ref().unwrap();
                 let device = &self.vfio.as_ref().unwrap().0;
-                device
-                    .enable_irq(VFIO_PCI_INTX_IRQ_INDEX, vec![&intx.event])
-                    .map_err(io::Error::other)?;
+                set_irq_eventfds(device, VFIO_PCI_INTX_IRQ_INDEX, &[intx.event.as_raw_fd()])?;
                 self.mode = Some(VFIO_PCI_INTX_IRQ_INDEX);
                 device
                     .set_irq_resample_fd(VFIO_PCI_INTX_IRQ_INDEX, vec![&intx.resample])
@@ -794,20 +958,50 @@ impl VfioPci {
                 for i in 0..messages.len() {
                     self.interrupts.push(Interrupt {
                         event: EventFd::new(libc::EFD_NONBLOCK | libc::EFD_CLOEXEC)?,
-                        gsi: base + i as u32,
+                        gsi: self.gsis.start + i as u32,
                         registered: false,
                     });
                 }
                 let device = &self.vfio.as_ref().unwrap().0;
-                device
-                    .enable_irq(index, self.interrupts.iter().map(|i| &i.event).collect())
-                    .map_err(io::Error::other)?;
+                set_irq_eventfds(
+                    device,
+                    index,
+                    &self
+                        .interrupts
+                        .iter()
+                        .map(|i| i.event.as_raw_fd())
+                        .collect::<Vec<_>>(),
+                )?;
                 self.mode = Some(index);
             }
             _ => (),
         }
-        for (irq, message) in self.interrupts.iter_mut().zip(&messages) {
-            if !irq.registered && !message.masked {
+        self.route_vectors(0..self.gsis.len(), &messages)
+    }
+    /// `messages` starts at the first of `vectors`. Vectors without an unmasked
+    /// message lose their route.
+    fn route_vectors(&mut self, vectors: Range<usize>, messages: &[Message]) -> io::Result<()> {
+        let unmasked = |vector: usize| messages.get(vector - vectors.start).filter(|m| !m.masked);
+        let active = vectors.start..vectors.end.min(self.interrupts.len());
+        // Keep eventfds across masking and message changes so that masked
+        // interrupts remain pending and KVM injects them when the irqfd is
+        // registered again.
+        for (vector, irq) in active.clone().zip(&mut self.interrupts[active.clone()]) {
+            if irq.registered && unmasked(vector).is_none() {
+                self.vm.unregister_irqfd(&irq.event, irq.gsi)?;
+                irq.registered = false;
+            }
+        }
+        let base = self.gsis.start;
+        self.routing
+            .lock()
+            .unwrap()
+            .update(vectors.clone().map(|vector| {
+                let message = unmasked(vector).map(|m| (m.address, m.data));
+                (base + vector as u32, message)
+            }))?;
+        for (vector, irq) in active.clone().zip(&mut self.interrupts[active]) {
+            if !irq.registered && unmasked(vector).is_some() {
                 self.vm.register_irqfd(&irq.event, irq.gsi)?;
                 irq.registered = true;
                 consume_event(&irq.event)?;
@@ -876,13 +1070,10 @@ impl VfioPci {
         if self.failed || self.vfio.is_none() || !self.bars_valid() {
             return None;
         }
-        self.bars
-            .iter()
-            .find(|bar| {
-                contains(bar.address, bar.size, address, length as u64)
-                    && self.access.decoding(&self.config, bar.decode_enable())
-            })
-            .map(|bar| (bar.index, address - bar.address))
+        self.bars.iter().find_map(|bar| {
+            bar.access(address, length, &self.config, &self.access)
+                .map(|offset| (bar.index, offset))
+        })
     }
 }
 impl Drop for VfioPci {
@@ -965,19 +1156,60 @@ impl PciFunction for VfioPci {
         let Some((bar, offset)) = self.bar(address, data.len()) else {
             return PciBarAccess::Unhandled;
         };
-        if let Err(error) = self.io_read(bar as u32, offset, data) {
-            log::debug!("VFIO BAR {bar} read at {offset:#x}: {error}");
+        let result = if let Some(msix) = &self.msix
+            && let Some(access) = msix.access(bar, offset, data.len())
+        {
+            match access {
+                MsixAccess::Table(index) => {
+                    data.copy_from_slice(&msix.table[index..index + data.len()]);
+                    Ok(())
+                }
+                MsixAccess::Pba(index) => {
+                    read_msix_pending(self.mode, &self.interrupts, index, data)
+                }
+                MsixAccess::Straddling => {
+                    data.fill(0xff);
+                    Ok(())
+                }
+            }
+        } else {
+            if let Err(error) = self.io_read(bar as u32, offset, data) {
+                log::debug!("VFIO BAR {bar} read at {offset:#x}: {error}");
+                data.fill(0xff);
+            }
+            Ok(())
+        };
+        if result.is_err() {
             data.fill(0xff);
         }
+        self.failure(result);
         PciBarAccess::Handled
     }
     fn write_bar(&mut self, address: u64, data: &[u8]) -> PciBarAccess {
         let Some((bar, offset)) = self.bar(address, data.len()) else {
             return PciBarAccess::Unhandled;
         };
-        if let Err(error) = self.io_write(bar as u32, offset, data) {
-            log::debug!("VFIO BAR {bar} write at {offset:#x}: {error}");
-        }
+        let result = if let Some(msix) = &mut self.msix
+            && let Some(access) = msix.access(bar, offset, data.len())
+        {
+            if let MsixAccess::Table(index) = access {
+                let vectors = msix.write_table(index, data);
+                if self.mode == Some(VFIO_PCI_MSIX_IRQ_INDEX) {
+                    let messages = msix.messages(&self.config, vectors.clone());
+                    self.route_vectors(vectors, &messages)
+                } else {
+                    Ok(())
+                }
+            } else {
+                Ok(())
+            }
+        } else {
+            if let Err(error) = self.io_write(bar as u32, offset, data) {
+                log::debug!("VFIO BAR {bar} write at {offset:#x}: {error}");
+            }
+            Ok(())
+        };
+        self.failure(result);
         PciBarAccess::Handled
     }
 }
@@ -988,6 +1220,15 @@ mod tests {
     use crate::vmm::device_manager::irq::IrqAllocator;
     use crate::vmm::device_manager::pci::PciHostManager;
 
+    pub(super) fn test_bar() -> Bar {
+        Bar {
+            index: 0,
+            flags: 0,
+            size: 0x8000,
+            address: 0xe010_0000,
+            window: 0xe010_0000..0xe011_0000,
+        }
+    }
     #[test]
     fn vfio_bar_probing_bounds_and_large_window() {
         let mut config = [0u8; 256];
@@ -1017,11 +1258,13 @@ mod tests {
         put16(&mut config, PCI_STATUS, PCI_STATUS_CAP_LIST);
         config[PCI_CAPABILITY_LIST] = 0x40;
         config[0x40] = PCI_CAP_ID_PM;
-        assert!(capabilities(&mut config.clone(), &mut ConfigAccess::new(), 0).is_ok());
+        assert!(capabilities(&mut config.clone(), &mut ConfigAccess::new(), 0, &[], 0).is_ok());
         for next in [0x40, 0x41, 0x20, 0x44] {
             config[0x41] = next;
             config[0x44] = PCI_CAP_ID_PM;
-            assert!(capabilities(&mut config.clone(), &mut ConfigAccess::new(), 0).is_err());
+            assert!(
+                capabilities(&mut config.clone(), &mut ConfigAccess::new(), 0, &[], 0).is_err()
+            );
         }
     }
     #[test]
@@ -1034,9 +1277,9 @@ mod tests {
             config[0x41] = 0x40 + size;
             put16(&mut config, 0x42, flags);
             config[0x40 + size as usize] = PCI_CAP_ID_PM;
-            assert!(capabilities(&mut config.clone(), &mut ConfigAccess::new(), 0).is_ok());
+            assert!(capabilities(&mut config.clone(), &mut ConfigAccess::new(), 0, &[], 0).is_ok());
             config[0x41] -= 4;
-            assert!(capabilities(&mut config, &mut ConfigAccess::new(), 0).is_err());
+            assert!(capabilities(&mut config, &mut ConfigAccess::new(), 0, &[], 0).is_err());
         }
         for flags in [0, 3, 0x42, 0xf2] {
             let mut config = [0; CONFIG_SIZE];
@@ -1044,7 +1287,7 @@ mod tests {
             config[PCI_CAPABILITY_LIST] = 0x40;
             config[0x40] = PCI_CAP_ID_EXP;
             put16(&mut config, 0x42, flags);
-            assert!(capabilities(&mut config, &mut ConfigAccess::new(), 0).is_err());
+            assert!(capabilities(&mut config, &mut ConfigAccess::new(), 0, &[], 0).is_err());
         }
     }
     #[test]
@@ -1111,30 +1354,32 @@ mod tests {
         config[PCI_CAPABILITY_LIST] = 0x40;
         config[0x40] = PCI_CAP_ID_MSI;
         put16(&mut config, 0x42, 0x18e);
-        assert!(capabilities(&mut config.clone(), &mut ConfigAccess::new(), 0).is_err());
+        assert!(capabilities(&mut config.clone(), &mut ConfigAccess::new(), 0, &[], 0).is_err());
         let mut exposed = config;
         assert_eq!(
-            capabilities(&mut exposed, &mut ConfigAccess::new(), 1).unwrap(),
+            capabilities(&mut exposed, &mut ConfigAccess::new(), 1, &[], 0)
+                .unwrap()
+                .0,
             Some(0x40)
         );
         assert_eq!(get16(&exposed, 0x42), 0x180);
         config[0x41] = 0x54;
         config[0x54] = PCI_CAP_ID_PM;
-        assert!(capabilities(&mut config, &mut ConfigAccess::new(), 1).is_err());
+        assert!(capabilities(&mut config, &mut ConfigAccess::new(), 1, &[], 0).is_err());
     }
     #[test]
     fn vfio_msi_mask_selection_and_pending_event() {
         let mut config = [0; CONFIG_SIZE];
         put16(&mut config, 0x42, 0x181);
         put32(&mut config, 0x44, 0xfee0_0000);
-        let (mode, messages) = irq_messages(&config, Some(0x40));
+        let (mode, messages) = irq_messages(&config, Some(0x40), None);
         assert_eq!(mode, Some(VFIO_PCI_MSI_IRQ_INDEX));
         assert!(!messages[0].masked);
         put32(&mut config, 0x50, 1);
-        assert!(irq_messages(&config, Some(0x40)).1[0].masked);
+        assert!(irq_messages(&config, Some(0x40), None).1[0].masked);
         put16(&mut config, 0x42, 0x180);
         assert_eq!(
-            irq_messages(&config, Some(0x40)),
+            irq_messages(&config, Some(0x40), None),
             (Some(VFIO_PCI_INTX_IRQ_INDEX), vec![])
         );
         let event = EventFd::new(libc::EFD_NONBLOCK).unwrap();
@@ -1166,7 +1411,7 @@ mod tests {
                 config[0x60] = PCI_CAP_ID_PM;
                 put16(&mut config, 0x42, flags | PCI_MSI_FLAGS_QMASK);
                 let mut access = ConfigAccess::new();
-                capabilities(&mut config, &mut access, 1).unwrap();
+                capabilities(&mut config, &mut access, 1, &[], 0).unwrap();
                 let old = config;
                 for (offset, bytes) in [(0x40, [0xff; 4]), (layout.data, [0x34, 0x12, 0xff, 0xff])]
                 {
@@ -1196,6 +1441,188 @@ mod tests {
                     .unwrap();
                 assert_eq!(data, config[0x40..layout.end]);
             }
+        }
+    }
+    fn test_msix() -> Msix {
+        Msix {
+            cap: 0x60,
+            bar: 0,
+            offset: 0x1ff0,
+            table: vec![0; 64],
+            pba_bar: 0,
+            pba_offset: 0x4000,
+        }
+    }
+    #[test]
+    fn vfio_msix_capability_rejects_bad_table_and_pending_bit_array() {
+        let mut config = [0; CONFIG_SIZE];
+        put16(&mut config, PCI_STATUS, PCI_STATUS_CAP_LIST);
+        config[PCI_CAPABILITY_LIST] = 0x40;
+        config[0x40] = PCI_CAP_ID_MSIX;
+        put32(&mut config, 0x44, 0x1000);
+        put32(&mut config, 0x48, 0x4000);
+        put16(&mut config, 0x42, 3);
+        let (_, msix) = capabilities(
+            &mut config.clone(),
+            &mut ConfigAccess::new(),
+            0,
+            &[test_bar()],
+            4,
+        )
+        .unwrap();
+        assert_eq!(msix.unwrap().table.len(), 64);
+        assert!(
+            capabilities(
+                &mut config.clone(),
+                &mut ConfigAccess::new(),
+                0,
+                &[test_bar()],
+                3
+            )
+            .is_err()
+        );
+        for location in [1, 0x8000, 0x7ff8] {
+            put32(&mut config, 0x44, location);
+            assert!(
+                capabilities(
+                    &mut config.clone(),
+                    &mut ConfigAccess::new(),
+                    0,
+                    &[test_bar()],
+                    4
+                )
+                .is_err()
+            );
+        }
+        put32(&mut config, 0x44, 0x4000);
+        assert!(
+            capabilities(
+                &mut config.clone(),
+                &mut ConfigAccess::new(),
+                0,
+                &[test_bar()],
+                4
+            )
+            .is_err()
+        );
+        config[PCI_CAPABILITY_LIST] = 0xfc;
+        config[0xfc] = PCI_CAP_ID_MSIX;
+        assert!(capabilities(&mut config, &mut ConfigAccess::new(), 0, &[test_bar()], 4).is_err());
+    }
+    #[test]
+    fn vfio_msix_partial_table_accesses_stay_trapped() {
+        let table = Msix {
+            cap: 0x40,
+            bar: 5,
+            offset: 0x1000,
+            table: vec![0; 64],
+            pba_bar: 5,
+            pba_offset: 0x2000,
+        };
+        assert!(matches!(
+            table.access(5, 0x1004, 4),
+            Some(MsixAccess::Table(4))
+        ));
+        assert!(matches!(
+            table.access(5, 0x2004, 4),
+            Some(MsixAccess::Pba(4))
+        ));
+        for offset in [0xffc, 0x103c, 0x1ffc, 0x2004] {
+            assert!(matches!(
+                table.access(5, offset, 8),
+                Some(MsixAccess::Straddling)
+            ));
+        }
+        assert!(table.access(5, 0x1040, 8).is_none());
+        assert!(table.access(5, 0x2008, 8).is_none());
+        assert!(table.access(0, 0x1000, 8).is_none());
+    }
+    #[test]
+    fn vfio_msix_mask_selection() {
+        let mut config = [0; CONFIG_SIZE];
+        put16(&mut config, 0x42, 0x181);
+        let mut msix = test_msix();
+        assert_eq!(
+            irq_messages(&config, Some(0x40), Some(&msix)).0,
+            Some(VFIO_PCI_MSI_IRQ_INDEX)
+        );
+        put16(&mut config, msix.cap + 2, 0x8000);
+        put32(&mut msix.table, 12, 1);
+        let (mode, messages) = irq_messages(&config, Some(0x40), Some(&msix));
+        assert_eq!(mode, Some(VFIO_PCI_MSIX_IRQ_INDEX));
+        assert!(messages[0].masked);
+        assert!(!messages[1].masked);
+        put16(&mut config, msix.cap + 2, 0xc000);
+        assert!(
+            irq_messages(&config, Some(0x40), Some(&msix))
+                .1
+                .iter()
+                .all(|m| m.masked)
+        );
+    }
+    #[test]
+    fn vfio_msix_table_writes_reevaluate_only_touched_vectors() {
+        let mut msix = test_msix();
+        let data = PCI_MSIX_ENTRY_SIZE + PCI_MSIX_ENTRY_DATA;
+        assert_eq!(msix.write_table(data, &0x45u32.to_le_bytes()), 1..2);
+        assert_eq!(msix.write_table(PCI_MSIX_ENTRY_SIZE - 4, &[0; 8]), 0..2);
+        assert_eq!(
+            msix.messages(&[0; CONFIG_SIZE], 1..2),
+            [Message {
+                address: 0,
+                data: 0x45,
+                masked: false,
+            }]
+        );
+    }
+    #[test]
+    fn vfio_msix_pending_reads_preserve_events_and_exclude_msi() {
+        let irq = Interrupt {
+            event: EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+            gsi: 24,
+            registered: false,
+        };
+        irq.event.write(1).unwrap();
+        let interrupts = [irq];
+        let mut data = [0xff; 8];
+        read_msix_pending(Some(VFIO_PCI_MSI_IRQ_INDEX), &interrupts, 0, &mut data).unwrap();
+        assert_eq!(data, [0; 8]);
+        for _ in 0..2 {
+            read_msix_pending(Some(VFIO_PCI_MSIX_IRQ_INDEX), &interrupts, 0, &mut data).unwrap();
+            assert_eq!(data, [1, 0, 0, 0, 0, 0, 0, 0]);
+        }
+        read_msix_pending(Some(VFIO_PCI_MSIX_IRQ_INDEX), &interrupts, 1, &mut data).unwrap();
+        assert_eq!(data, [0; 8]);
+        assert_eq!(interrupts[0].event.read().unwrap(), 1);
+    }
+    #[test]
+    fn vfio_msix_capability_dword_writes_preserve_header_and_table_locations() {
+        for width in [1, 2, 4] {
+            let mut config = [0; CONFIG_SIZE];
+            put16(&mut config, PCI_STATUS, PCI_STATUS_CAP_LIST);
+            config[PCI_CAPABILITY_LIST] = 0x40;
+            config[0x40] = PCI_CAP_ID_MSIX;
+            config[0x41] = 0x50;
+            config[0x50] = PCI_CAP_ID_PM;
+            put16(&mut config, 0x42, 3);
+            put32(&mut config, 0x44, 0x1000);
+            put32(&mut config, 0x48, 0x4000);
+            let mut access = ConfigAccess::new();
+            capabilities(&mut config, &mut access, 0, &[test_bar()], 4).unwrap();
+            let old = config;
+            for (i, bytes) in [0xff; 12].chunks(width).enumerate() {
+                let start = 0x40 + i * width;
+                access
+                    .write(start, bytes, |_, _| panic!("MSI-X is emulated"))
+                    .unwrap();
+                access.emulate(&mut config, start, bytes);
+            }
+            assert_eq!(&config[0x40..0x42], &old[0x40..0x42]);
+            assert_eq!(
+                get16(&config, 0x42),
+                3 | PCI_MSIX_FLAGS_ENABLE | PCI_MSIX_FLAGS_MASKALL
+            );
+            assert_eq!(&config[0x44..0x58], &old[0x44..0x58]);
         }
     }
 }

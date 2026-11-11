@@ -149,6 +149,7 @@ pub(super) fn write_bars(config: &mut [u8], bars: &mut [Bar], start: usize, data
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::test_bar;
     use super::*;
 
     fn endpoint() -> ([u8; CONFIG_SIZE], ConfigAccess) {
@@ -161,7 +162,7 @@ mod tests {
         put16(&mut config, 0x82, 2);
         put32(&mut config, 0x84, PCI_EXP_DEVCAP_FLR);
         let mut access = ConfigAccess::new();
-        capabilities(&mut config, &mut access, 0).unwrap();
+        capabilities(&mut config, &mut access, 0, &[], 0).unwrap();
         (config, access)
     }
 
@@ -214,7 +215,7 @@ mod tests {
         put32(&mut config, 0x84, PCI_EXP_DEVCAP_FLR);
         put16(&mut config, 0x88, PCI_EXP_DEVCTL_BCR_FLR);
         let mut access = ConfigAccess::new();
-        capabilities(&mut config, &mut access, 0).unwrap();
+        capabilities(&mut config, &mut access, 0, &[], 0).unwrap();
         assert_eq!(config[PCI_CAPABILITY_LIST], 0x80);
         assert!(access.forwarded[0x40..0x68].iter().all(|byte| *byte == 0));
         assert!(
@@ -326,7 +327,8 @@ mod tests {
     #[test]
     fn vfio_power_gate_uses_backend_state_and_independent_decode_bits() {
         let (mut config, access) = endpoint();
-        for state in 0u16..4 {
+        let mut bar = test_bar();
+        for state in [0u16, 3] {
             for command in 0u16..4 {
                 // The backend can reject a requested transition to D0.
                 access.write(0x44, &[0, 0], |_, _| Ok(())).unwrap();
@@ -343,14 +345,16 @@ mod tests {
                         Ok(())
                     })
                     .unwrap();
-                assert_eq!(
-                    access.decoding(&config, PCI_COMMAND_IO),
-                    state == 0 && command & 1 != 0
-                );
-                assert_eq!(
-                    access.decoding(&config, PCI_COMMAND_MEMORY),
-                    state == 0 && command & 2 != 0
-                );
+                for (flags, enable) in [
+                    (PCI_BASE_ADDRESS_SPACE_IO, PCI_COMMAND_IO),
+                    (0, PCI_COMMAND_MEMORY),
+                ] {
+                    bar.flags = flags;
+                    assert_eq!(
+                        bar.access(bar.address + 4, 4, &config, &access),
+                        (state == 0 && command & enable != 0).then_some(4)
+                    );
+                }
             }
         }
     }
