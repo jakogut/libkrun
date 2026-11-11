@@ -70,6 +70,11 @@ impl<'a> AttachDevice<'a> for VfioDevice {
         let vfio = Arc::new(Mutex::new(vfio));
         // Register cleanup before subsequent fallible attachment operations.
         ctx.push_exit_observer(vfio.clone());
+        ctx.subscribe_events(vfio.clone()).map_err(|e| {
+            VmmError::Internal(format!(
+                "VFIO host notification event-loop registration failed: {e}"
+            ))
+        })?;
         ctx.register_pci_function(address, irq, vfio)
     }
 }

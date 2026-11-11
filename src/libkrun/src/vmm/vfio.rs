@@ -4,9 +4,13 @@
 use crate::api::AttachContext;
 mod config;
 mod irq;
+mod lifecycle;
 mod mapping;
 use irq::set_irq_eventfds;
+use lifecycle::Lifecycle;
 use mapping::{Mapping, mapping_ranges, prepare_bar, set_memory, write_quiesced};
+use polly::event_manager::{EventManager, Subscriber};
+use utils::epoll::EpollEvent;
 mod pci_regs;
 use crate::vmm::device_manager::pci::PciBarKind;
 use crate::vmm::gsi_routing::GsiRouting;
@@ -23,10 +27,7 @@ use std::io;
 use std::ops::Range;
 use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicI32, Ordering},
-};
+use std::sync::{Arc, Mutex};
 use std::{array, mem, ptr};
 use utils::eventfd::EventFd;
 use vfio_bindings::bindings::vfio::*;
@@ -699,8 +700,7 @@ pub(crate) struct VfioPci {
     mappings: Vec<Mapping>,
     dma: Vec<(u64, usize)>,
     pub(crate) address: PciAddress,
-    exit_evt: EventFd,
-    exit_code: Arc<AtomicI32>,
+    lifecycle: Lifecycle,
     irq: u32,
     intx: Option<Intx>,
     mode: Option<u32>,
@@ -709,7 +709,6 @@ pub(crate) struct VfioPci {
     msix: Option<Msix>,
     routing: Arc<Mutex<GsiRouting>>,
     gsis: Range<u32>,
-    failed: bool,
 }
 impl VfioPci {
     pub(crate) fn irq(&self) -> u32 {
@@ -784,8 +783,7 @@ impl VfioPci {
             dma: Vec::new(),
             address,
             irq,
-            exit_evt: ctx.exit_evt()?,
-            exit_code: ctx.exit_code().clone(),
+            lifecycle: Lifecycle::new(ctx.exit_evt()?, ctx.exit_code().clone()),
             intx: None,
             mode: None,
             interrupts: Vec::new(),
@@ -793,7 +791,6 @@ impl VfioPci {
             msix: None,
             routing,
             gsis: 0..0,
-            failed: false,
         };
         device.initialize(ctx)?;
         Ok(device)
@@ -864,6 +861,13 @@ impl VfioPci {
             self.io_read(VFIO_PCI_CONFIG_REGION_INDEX, start as u64, data)
         })?;
         self.config = config;
+        let device = &self.vfio.as_ref().unwrap().0;
+        for index in [VFIO_PCI_ERR_IRQ_INDEX, VFIO_PCI_REQ_IRQ_INDEX] {
+            self.lifecycle
+                .register(index, device.get_irq_info(index), |event| {
+                    set_irq_eventfds(device, index, &[event.as_raw_fd()])
+                })?;
+        }
         for (address, size, host) in dma_regions(&self.mem, &ctx.shm_regions())? {
             // SAFETY: the memory clone is retained until DMA has been unmapped.
             unsafe { self.container().vfio_dma_map(address, size, host) }.map_err(|e| {
@@ -1087,6 +1091,13 @@ impl VfioPci {
         ) {
             errors.push(format!("disable DMA: {e}"));
         }
+        let device = &self.vfio.as_ref().unwrap().0;
+        if let Err(error) = self
+            .lifecycle
+            .disable(|index| device.disable_irq(index).map_err(io::Error::other))
+        {
+            errors.push(error.to_string());
+        }
         if let Err(e) = self.clear_interrupts() {
             errors.push(format!("disable interrupts: {e}"));
         }
@@ -1136,16 +1147,11 @@ impl VfioPci {
     }
     fn failure(&mut self, result: io::Result<()>) {
         if let Err(error) = result {
-            self.failed = true;
-            log::error!("VFIO device access: {error}");
-            self.exit_code.store(1, Ordering::SeqCst);
-            if let Err(error) = self.exit_evt.write(1) {
-                log::error!("VFIO exit notification: {error}");
-            }
+            self.lifecycle.fail(error.to_string());
         }
     }
     fn bar(&self, address: u64, length: usize) -> Option<(usize, u64)> {
-        if self.failed || self.vfio.is_none() || !self.bars_valid() {
+        if self.lifecycle.failed() || self.vfio.is_none() || !self.bars_valid() {
             return None;
         }
         self.bars.iter().find_map(|bar| {
@@ -1165,6 +1171,15 @@ impl Drop for VfioPci {
         }
     }
 }
+impl Subscriber for VfioPci {
+    fn process(&mut self, event: &EpollEvent, event_manager: &mut EventManager) {
+        self.lifecycle.process(event, event_manager);
+    }
+
+    fn interest_list(&self) -> Vec<EpollEvent> {
+        self.lifecycle.interest_list()
+    }
+}
 impl VmmExitObserver for VfioPci {
     fn on_vmm_exit(&mut self) {
         if let Err(error) = self.shutdown() {
@@ -1175,7 +1190,7 @@ impl VmmExitObserver for VfioPci {
 impl PciFunction for VfioPci {
     fn read_config(&mut self, offset: u16, data: &mut [u8]) {
         let start = offset as usize;
-        if self.failed || self.vfio.is_none() || start + data.len() > CONFIG_SIZE {
+        if self.lifecycle.failed() || self.vfio.is_none() || start + data.len() > CONFIG_SIZE {
             data.fill(0xff);
             return;
         }
@@ -1220,7 +1235,7 @@ impl PciFunction for VfioPci {
         self.failure(result);
     }
     fn write_config(&mut self, offset: u16, data: &[u8]) {
-        if self.failed || self.vfio.is_none() {
+        if self.lifecycle.failed() || self.vfio.is_none() {
             return;
         }
         let start = offset as usize;
